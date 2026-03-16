@@ -30,7 +30,7 @@ param(
     [switch]$SkipWhisper
 )
 
-$ErrorActionPreference = "Stop"
+$ErrorActionPreference = "SilentlyContinue"
 
 function Write-Step($msg) { Write-Host "`n>>> $msg" -ForegroundColor Cyan }
 function Write-Ok($msg) { Write-Host "    [OK] $msg" -ForegroundColor Green }
@@ -48,17 +48,56 @@ Write-Host @"
 # --- Check prerequisites ---
 Write-Step "Checking prerequisites"
 
-# Python
-$python = Get-Command python -ErrorAction SilentlyContinue
-if (-not $python) {
-    Write-Fail "Python not found. Install Python 3.10+ from https://python.org"
+# Python - find working python 3.10+ executable
+$pythonExe = $null
+
+# Search: PATH commands, py launcher, pyenv, common install locations
+$searchPaths = @()
+# Commands in PATH
+foreach ($name in @("python3.exe", "python.exe")) {
+    $cmd = Get-Command $name -ErrorAction SilentlyContinue
+    if ($cmd) { $searchPaths += $cmd.Source }
+}
+# py launcher
+$py = Get-Command py.exe -ErrorAction SilentlyContinue
+if ($py) { $searchPaths += "py.exe" }
+# pyenv-win
+$pyenvRoot = "$env:USERPROFILE\.pyenv\pyenv-win\versions"
+if (Test-Path $pyenvRoot) {
+    Get-ChildItem $pyenvRoot -Directory | Sort-Object Name -Descending | ForEach-Object {
+        $p = Join-Path $_.FullName "python.exe"
+        if (Test-Path $p) { $searchPaths += $p }
+    }
+}
+# Common install locations
+foreach ($p in @("$env:LOCALAPPDATA\Programs\Python\Python312\python.exe",
+                  "$env:LOCALAPPDATA\Programs\Python\Python311\python.exe",
+                  "$env:LOCALAPPDATA\Programs\Python\Python310\python.exe",
+                  "C:\Python312\python.exe", "C:\Python311\python.exe")) {
+    if (Test-Path $p) { $searchPaths += $p }
+}
+
+foreach ($candidate in $searchPaths) {
+    try {
+        if ($candidate -eq "py.exe") {
+            $ver = py -3 --version 2>&1 | Out-String
+        } else {
+            $ver = & $candidate --version 2>&1 | Out-String
+        }
+        if ($ver -match 'Python 3\.(1[0-9]|[2-9][0-9])') {
+            $pythonExe = $candidate
+            break
+        }
+    } catch {}
+}
+if (-not $pythonExe) {
+    Write-Fail "Python 3.10+ not found. Install from https://python.org"
     exit 1
 }
-$pyVer = python --version 2>&1
-Write-Ok "Python: $pyVer"
+Write-Ok "Python: $(& $pythonExe --version 2>&1) ($pythonExe)"
 
 # pip
-python -m pip --version | Out-Null
+& $pythonExe -m pip --version 2>&1 | Out-Null
 if ($LASTEXITCODE -ne 0) {
     Write-Fail "pip not found"
     exit 1
@@ -94,15 +133,15 @@ Write-Ok "Directory ready"
 Write-Step "Setting up VoiceMode MCP virtual environment"
 $mcpVenv = Join-Path $InstallDir "mcp-venv"
 if (-not (Test-Path "$mcpVenv\Scripts\python.exe")) {
-    python -m venv $mcpVenv
+    & $pythonExe -m venv $mcpVenv
     Write-Ok "Created venv: $mcpVenv"
 } else {
     Write-Ok "Venv already exists: $mcpVenv"
 }
 
 & "$mcpVenv\Scripts\python.exe" -m pip install --upgrade pip --quiet 2>&1 | Out-Null
-& "$mcpVenv\Scripts\pip.exe" install "setuptools<71" webrtcvad voice-mode --quiet 2>&1
-if ($LASTEXITCODE -ne 0) {
+& "$mcpVenv\Scripts\pip.exe" install "setuptools<71" webrtcvad voice-mode --quiet 2>&1 | Out-Null
+if (-not (Test-Path "$mcpVenv\Scripts\voice-mode.exe")) {
     Write-Fail "Failed to install voice-mode"
     exit 1
 }
@@ -119,10 +158,10 @@ if (-not $SkipWhisper) {
     Write-Step "Setting up Whisper STT service"
     $sttVenv = Join-Path $InstallDir "stt-venv"
     if (-not (Test-Path "$sttVenv\Scripts\python.exe")) {
-        python -m venv $sttVenv
+        & $pythonExe -m venv $sttVenv
     }
     & "$sttVenv\Scripts\python.exe" -m pip install --upgrade pip --quiet 2>&1 | Out-Null
-    & "$sttVenv\Scripts\pip.exe" install faster-whisper-server --quiet 2>&1
+    & "$sttVenv\Scripts\pip.exe" install faster-whisper-server --quiet 2>&1 | Out-Null
 
     # Patch faster-whisper-server version lookup bug
     $apiFile = Join-Path $sttVenv "Lib\site-packages\faster_whisper_server\api.py"
@@ -160,8 +199,14 @@ if (-not $SkipKokoro) {
     # Clone Kokoro-FastAPI
     $kokoroDir = Join-Path $InstallDir "Kokoro-FastAPI"
     if (-not (Test-Path "$kokoroDir\pyproject.toml")) {
-        git clone --depth 1 https://github.com/remsky/Kokoro-FastAPI.git $kokoroDir 2>&1
-        if ($LASTEXITCODE -ne 0) {
+        # Remove partial clone if exists
+        if (Test-Path $kokoroDir) {
+            Remove-Item -Recurse -Force $kokoroDir -ErrorAction SilentlyContinue
+        }
+        $ErrorActionPreference = "Continue"
+        git clone --depth 1 https://github.com/remsky/Kokoro-FastAPI.git $kokoroDir 2>&1 | Out-Null
+        $ErrorActionPreference = "SilentlyContinue"
+        if (-not (Test-Path "$kokoroDir\pyproject.toml")) {
             Write-Fail "Failed to clone Kokoro-FastAPI"
             exit 1
         }
@@ -171,16 +216,24 @@ if (-not $SkipKokoro) {
     # Create venv and install
     $ttsVenv = Join-Path $InstallDir "tts-venv"
     if (-not (Test-Path "$ttsVenv\Scripts\python.exe")) {
-        python -m venv $ttsVenv
+        & $pythonExe -m venv $ttsVenv
     }
     & "$ttsVenv\Scripts\python.exe" -m pip install --upgrade pip --quiet 2>&1 | Out-Null
 
-    $extra = if ($GpuSupport) { "gpu" } else { "cpu" }
+    # Install PyTorch first (pip can't resolve uv-specific index sources)
+    if ($GpuSupport) {
+        Write-Step "Installing PyTorch with CUDA support (this may take a while)..."
+        & "$ttsVenv\Scripts\pip.exe" install torch --index-url https://download.pytorch.org/whl/cu129 --quiet 2>&1 | Out-Null
+    } else {
+        & "$ttsVenv\Scripts\pip.exe" install torch --index-url https://download.pytorch.org/whl/cpu --quiet 2>&1 | Out-Null
+    }
+
+    # Install Kokoro-FastAPI (without extras since torch is already installed)
     Push-Location $kokoroDir
-    & "$ttsVenv\Scripts\pip.exe" install -e ".[$extra]" --quiet 2>&1
+    & "$ttsVenv\Scripts\pip.exe" install -e . --quiet 2>&1 | Out-Null
     Pop-Location
 
-    if ($LASTEXITCODE -ne 0) {
+    if (-not (Test-Path "$ttsVenv\Scripts\uvicorn.exe")) {
         Write-Fail "Failed to install Kokoro-FastAPI"
         exit 1
     }
@@ -190,8 +243,13 @@ if (-not $SkipKokoro) {
     $modelPath = Join-Path $kokoroDir "api\src\models\v1_0\kokoro-v1_0.pth"
     if (-not (Test-Path $modelPath)) {
         Write-Step "Downloading Kokoro model (313MB)..."
-        & "$ttsVenv\Scripts\python.exe" "$kokoroDir\docker\scripts\download_model.py" --output "$kokoroDir\api\src\models\v1_0" 2>&1
-        Write-Ok "Model downloaded"
+        & "$ttsVenv\Scripts\python.exe" "$kokoroDir\docker\scripts\download_model.py" --output "$kokoroDir\api\src\models\v1_0" 2>&1 | Out-Null
+        if (Test-Path $modelPath) {
+            Write-Ok "Model downloaded"
+        } else {
+            Write-Fail "Failed to download Kokoro model"
+            exit 1
+        }
     } else {
         Write-Ok "Model already downloaded"
     }
