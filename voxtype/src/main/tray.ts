@@ -5,6 +5,7 @@ import { setHotkeyMode, setHotkeyCombo, captureHotkey } from './hotkey';
 import { getEntries, clearHistory } from './history';
 import { WHISPER_MODELS, getCurrentModel, switchModel } from './whisper-model';
 import { FEATURED_VOICES, getCurrentVoice, setVoice } from './kokoro-voice';
+import { getAvailableModels, getCurrentLLMModel, setLLMModel, fetchModels } from './llm';
 
 let tray: Tray | null = null;
 
@@ -110,7 +111,29 @@ export function createTray(
         label: 'LLM enhance',
         type: 'checkbox',
         checked: s.enhanceEnabled,
-        click: (item) => { updateSettings({ enhanceEnabled: item.checked }); rebuildMenu(); },
+        click: (item: any) => { updateSettings({ enhanceEnabled: item.checked }); rebuildMenu(); },
+      },
+      {
+        label: 'LLM model',
+        submenu: (() => {
+          const models = getAvailableModels();
+          const current = getCurrentLLMModel();
+          if (models.length === 0) {
+            return [
+              { label: 'No models found', enabled: false },
+              { label: 'Refresh', click: async () => { await fetchModels(s.lmStudioUrl); rebuildMenu(); } },
+            ];
+          }
+          const items: Electron.MenuItemConstructorOptions[] = models.map((m) => ({
+            label: `${m.id}${m.state === 'loaded' ? ' (loaded)' : ''}`,
+            type: 'radio' as const,
+            checked: current === m.id,
+            click: () => { setLLMModel(m.id); rebuildMenu(); },
+          }));
+          items.push({ type: 'separator' });
+          items.push({ label: 'Refresh models', click: async () => { await fetchModels(s.lmStudioUrl); rebuildMenu(); } });
+          return items;
+        })(),
       },
       {
         label: 'Append mode',

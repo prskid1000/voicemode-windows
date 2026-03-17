@@ -2,7 +2,7 @@ import { app, BrowserWindow, ipcMain, screen } from 'electron';
 import path from 'path';
 import { startHotkeyListener, stopHotkeyListener, setHotkeyMode, setHotkeyCombo } from './hotkey';
 import { transcribe } from './stt';
-import { enhance } from './llm';
+import { enhance, fetchModels, ensureLMStudio } from './llm';
 import { typeText } from './typer';
 import { createTray } from './tray';
 import { hasSpeech, estimateDuration } from './vad';
@@ -149,8 +149,13 @@ app.whenReady().then(() => {
     return { ...settings };
   });
 
-  // Tray
-  createTray(mainWindow, () => settings, (partial) => Object.assign(settings, partial));
+  // Fetch LLM models, then build tray (so model submenu is populated)
+  ensureLMStudio(settings.lmStudioUrl)
+    .then(() => fetchModels(settings.lmStudioUrl))
+    .catch(() => {})
+    .finally(() => {
+      if (mainWindow) createTray(mainWindow, () => settings, (partial) => Object.assign(settings, partial));
+    });
 
   // Hotkey listener
   setHotkeyMode(settings.hotkeyMode);
