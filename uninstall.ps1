@@ -13,6 +13,7 @@ Write-Host "`n  VoiceMode Windows Uninstaller" -ForegroundColor Cyan
 try {
     Unregister-ScheduledTask -TaskName "VoiceMode-Whisper-STT" -Confirm:$false -ErrorAction SilentlyContinue
     Unregister-ScheduledTask -TaskName "VoiceMode-Kokoro-TTS" -Confirm:$false -ErrorAction SilentlyContinue
+    Unregister-ScheduledTask -TaskName "VoxType-Dictation" -Confirm:$false -ErrorAction SilentlyContinue
     Write-Host "  [OK] Removed scheduled tasks" -ForegroundColor Green
 } catch {
     Write-Host "  [WARN] Could not remove scheduled tasks (may need admin)" -ForegroundColor Yellow
@@ -27,6 +28,13 @@ if (Test-Path $claudeConfig) {
         $config | ConvertTo-Json -Depth 10 | Set-Content $claudeConfig -Encoding UTF8
         Write-Host "  [OK] Removed VoiceMode from Claude Code config" -ForegroundColor Green
     }
+}
+
+# Remove VoxType data
+$voxTypeData = Join-Path $env:USERPROFILE ".voxtype"
+if (Test-Path $voxTypeData) {
+    Remove-Item -Recurse -Force $voxTypeData -ErrorAction SilentlyContinue
+    Write-Host "  [OK] Removed VoxType data" -ForegroundColor Green
 }
 
 # Remove installation directory

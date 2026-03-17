@@ -5,3 +5,7 @@ dist/
 build/
 *.wav
 *.mp3
+node_modules/
+voxtype/dist/
+voxtype/node_modules/
+package-lock.json

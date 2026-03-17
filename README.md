@@ -2,11 +2,14 @@
 
 Local voice input/output for [Claude Code](https://claude.ai/claude-code) on Windows. Fully offline STT (Whisper) + TTS (Kokoro) with GPU acceleration.
 
+Includes **VoxType** — a local Wispr Flow alternative that lets you dictate into any Windows app with a global hotkey.
+
 ## What it does
 
 - **Speech-to-Text**: Local [faster-whisper-server](https://github.com/fedirz/faster-whisper-server) with OpenAI-compatible API
 - **Text-to-Speech**: Local [Kokoro-FastAPI](https://github.com/remsky/Kokoro-FastAPI) with GPU support
 - **MCP Integration**: Patched [VoiceMode](https://github.com/mbailey/voicemode) MCP server for Windows
+- **VoxType Dictation**: Electron overlay app — press hotkey, speak, text appears at cursor
 - **No cloud APIs**: Everything runs locally, full privacy
 - **Auto-start**: Task Scheduler integration for boot-time startup (hidden, no console window)
 
@@ -14,219 +17,144 @@ Local voice input/output for [Claude Code](https://claude.ai/claude-code) on Win
 
 - Windows 10/11
 - Python 3.10+ (3.12 recommended)
+- Node.js 18+ (for VoxType)
 - Git
 - ffmpeg (in PATH)
 - NVIDIA GPU (optional, for Kokoro TTS acceleration)
 - [Claude Code](https://claude.ai/claude-code) installed
+- [LM Studio](https://lmstudio.ai/) with any model loaded (for VoxType enhancement, optional)
 
 ## Quick Start
 
 ```powershell
-# Clone this repo (any drive/location works)
-git clone https://github.com/YOUR_USERNAME/voicemode-windows.git
+git clone https://github.com/prskid1000/voicemode-windows.git
 cd voicemode-windows
-
-# Run setup (PowerShell)
 .\setup.ps1
-
-# Or with custom ports
-.\setup.ps1 -WhisperPort 6600 -KokoroPort 6500
-
-# CPU-only (no GPU)
-.\setup.ps1 -GpuSupport $false
-
-# Custom install directory (default: %USERPROFILE%\.voicemode-windows)
-.\setup.ps1 -InstallDir "D:\voicemode"
 ```
 
-The setup script can be cloned to any drive/directory — it uses `$env:USERPROFILE` for the install location by default and resolves all paths dynamically.
+Setup will:
+1. Install VoiceMode MCP with Windows patches
+2. Install Whisper STT + Kokoro TTS services
+3. Build and install VoxType dictation app
+4. Create scheduled tasks for all 3 services
+5. Start everything immediately
 
-## Manual Start
+## VoxType — Voice Dictation
 
-```powershell
-# Start services (run each in a separate terminal)
-%USERPROFILE%\.voicemode-windows\start-whisper-stt.bat
-%USERPROFILE%\.voicemode-windows\start-kokoro-tts.bat
+Press your hotkey (default: **Ctrl+Win**), speak, release — text appears at your cursor in any app.
 
-# Restart Claude Code, then use voice
-```
+### Features
+
+- **Instant recording** — mic pre-warmed, no startup delay
+- **LLM enhancement** — cleans up filler words, fixes punctuation, formats numbers via local LM Studio
+- **Auto-stop on silence** — stops recording after 2s of silence
+- **VAD noise gate** — skips sending empty audio to Whisper
+- **Custom hotkey** — any two-key combo (click "Hotkey" in tray to set)
+- **Whisper model selector** — switch between Tiny/Base/Small/Medium/Large v3 from tray
+- **Kokoro voice selector** — 15 featured voices for VoiceMode TTS
+- **Transcription history** — last 20 entries, click to copy from tray
+- **Append mode** — append text after cursor instead of replacing selection
+- **Multi-monitor** — pill follows cursor to the active display
+- **Draggable pill** — drag to reposition, position persists across restarts
+- **Minimal UI** — 28px orb with animated states, expands only during recording
+
+### Pill States
+
+| State | Visual |
+|-------|--------|
+| Idle | Dark orb with breathing aurora glow |
+| Recording | Red pill with pulsing dot + live waveform |
+| Transcribing | Orb with amber spinner |
+| Enhancing | Orb with indigo sparkle |
+| Done | Orb with green checkmark |
+| Error | Orb with red lightning bolt |
+
+### Tray Menu
+
+Right-click the VoxType tray icon for settings:
+- Recording mode (hold / toggle)
+- Hotkey customization
+- Whisper model selection (restarts service automatically)
+- Kokoro voice selection
+- LLM enhance toggle
+- Append mode
+- Auto-stop on silence
+- VAD noise gate
+- History with copy-to-clipboard
 
 ## Auto-Start (Task Scheduler)
 
-Services run hidden in the background with no console window. Tasks run whether user is logged on or not — no password stored (S4U). If the PC was off at trigger time, services start as soon as the machine is available.
+Setup creates three scheduled tasks automatically:
 
-### Option 1: PowerShell script
+| Task | Service |
+|------|---------|
+| `VoiceMode-Whisper-STT` | Whisper STT server (port 6600) |
+| `VoiceMode-Kokoro-TTS` | Kokoro TTS server (port 6500) |
+| `VoxType-Dictation` | Dictation overlay app |
 
-```powershell
-.\create-scheduled-tasks.ps1
-```
-
-### Option 2: PowerShell commands (copy-paste)
-
-```powershell
-$installDir = "$env:USERPROFILE\.voicemode-windows"
-$user = [System.Security.Principal.WindowsIdentity]::GetCurrent().Name
-
-# --- Whisper STT ---
-$action = New-ScheduledTaskAction -Execute "cmd.exe" `
-    -Argument "/c `"$installDir\start-whisper-stt.bat`"" `
-    -WorkingDirectory $installDir
-$trigger = New-ScheduledTaskTrigger -AtLogOn -User $user
-$settings = New-ScheduledTaskSettingsSet `
-    -AllowStartIfOnBatteries `
-    -DontStopIfGoingOnBatteries `
-    -ExecutionTimeLimit (New-TimeSpan -Hours 0) `
-    -RestartCount 3 `
-    -RestartInterval (New-TimeSpan -Minutes 1) `
-    -StartWhenAvailable `
-    -Hidden
-$principal = New-ScheduledTaskPrincipal -UserId $user -LogonType S4U -RunLevel Limited
-Register-ScheduledTask -TaskName "VoiceMode-Whisper-STT" `
-    -Action $action -Trigger $trigger -Settings $settings -Principal $principal -Force
-
-# --- Kokoro TTS ---
-$action = New-ScheduledTaskAction -Execute "cmd.exe" `
-    -Argument "/c `"$installDir\start-kokoro-tts.bat`"" `
-    -WorkingDirectory $installDir
-$trigger = New-ScheduledTaskTrigger -AtLogOn -User $user
-$settings = New-ScheduledTaskSettingsSet `
-    -AllowStartIfOnBatteries `
-    -DontStopIfGoingOnBatteries `
-    -ExecutionTimeLimit (New-TimeSpan -Hours 0) `
-    -RestartCount 3 `
-    -RestartInterval (New-TimeSpan -Minutes 1) `
-    -StartWhenAvailable `
-    -Hidden
-$principal = New-ScheduledTaskPrincipal -UserId $user -LogonType S4U -RunLevel Limited
-Register-ScheduledTask -TaskName "VoiceMode-Kokoro-TTS" `
-    -Action $action -Trigger $trigger -Settings $settings -Principal $principal -Force
-```
-
-### Start/stop tasks manually
+All tasks run hidden, auto-restart on crash, no password required (S4U logon).
 
 ```powershell
-# Start
+# Manual control
 schtasks /run /tn VoiceMode-Whisper-STT
 schtasks /run /tn VoiceMode-Kokoro-TTS
+schtasks /run /tn VoxType-Dictation
 
 # Stop
 schtasks /end /tn VoiceMode-Whisper-STT
 schtasks /end /tn VoiceMode-Kokoro-TTS
-
-# Remove
-schtasks /delete /tn VoiceMode-Whisper-STT /f
-schtasks /delete /tn VoiceMode-Kokoro-TTS /f
+schtasks /end /tn VoxType-Dictation
 ```
-
-### Task settings explained
-
-| Setting | Value | Why |
-|---------|-------|-----|
-| `-Hidden` | true | No console window visible |
-| `-LogonType S4U` | Run whether logged on or not | No password stored |
-| `-ExecutionTimeLimit 0` | No time limit | Services run indefinitely |
-| `-AllowStartIfOnBatteries` | true | Works on laptop battery |
-| `-DontStopIfGoingOnBatteries` | true | Doesn't kill on unplug |
-| `-RestartCount 3` | 3 retries | Auto-restart on crash |
-| `-RestartInterval 1m` | 1 minute apart | Delay between retries |
-| `-StartWhenAvailable` | true | Run ASAP if missed trigger (e.g. PC was off) |
 
 ## Usage in Claude Code
 
-After setup and restarting Claude Code, use the `/mcp__voicemode__converse` command or invoke the `converse` tool:
+After setup and restarting Claude Code:
 
 ```
 # Start a voice conversation
 /mcp__voicemode__converse
 ```
 
-The tool will:
-1. Speak the message via Kokoro TTS
-2. Listen via your microphone (VAD auto-stops on silence)
-3. Transcribe via local Whisper STT
-4. Return the transcribed text
+## Architecture
 
-**STT only** (no TTS, just listen):
 ```
-converse("listening", skip_tts=true, wait_for_response=true)
+Claude Code                          Any Windows App
+    |                                      ^
+    v                                      |
+VoiceMode MCP (patched)              VoxType (Electron)
+    |                                 |          |
+    +---> Kokoro TTS --> Speaker      |    LM Studio
+    |     :6500                       |    :1234
+    |                                 |
+    +---> Mic --> Whisper STT <-------+
+                  :6600
 ```
-
-## Windows Patches
-
-VoiceMode is built for Linux/macOS. This project applies these patches for Windows:
-
-| File | Issue | Fix |
-|------|-------|-----|
-| `conch.py` | Uses `fcntl` (Unix-only) | Replaced with `msvcrt` for Windows file locking |
-| `migration_helpers.py` | Uses `os.uname()` | Replaced with `platform.system()` |
-| `model_install.py` | Uses `os.uname()` | Replaced with `platform.machine()` |
-| `simple_failover.py` | Sends `response_format=text` | Changed to `json` (faster-whisper-server compat) |
-| `simple_failover.py` | Sends `language=auto` | Removed (causes 500 on faster-whisper-server) |
-| `converse.py` | Slow `scipy.signal.resample` in VAD loop | Replaced with fast numpy decimation |
-| `faster_whisper_server/api.py` | Missing `pyproject.toml` in pip install | Added fallback version |
-
-Patches are applied automatically during setup via `patches/apply-patches.py`.
 
 ## Configuration
-
-Environment variables (set in `~/.claude.json` under `mcpServers.voicemode.env`):
 
 | Variable | Default | Description |
 |----------|---------|-------------|
 | `VOICEMODE_STT_BASE_URLS` | `http://127.0.0.1:6600/v1` | Whisper STT endpoint |
 | `VOICEMODE_TTS_BASE_URLS` | `http://127.0.0.1:6500/v1` | Kokoro TTS endpoint |
-| `VOICEMODE_DISABLE_SILENCE_DETECTION` | `false` | Disable VAD silence detection |
-| `VOICEMODE_DEFAULT_LISTEN_DURATION` | `30` | Max recording duration (seconds) |
-| `VOICEMODE_WHISPER_PORT` | `6600` | Whisper server port |
-| `VOICEMODE_KOKORO_PORT` | `6500` | Kokoro server port |
-
-## Architecture
-
-```
-Claude Code
-    |
-    v
-VoiceMode MCP (patched for Windows)
-    |
-    +---> Kokoro TTS (GPU) --> Speaker
-    |     localhost:6500
-    |
-    +---> Microphone --> Whisper STT
-          localhost:6600
-```
+| `VOICEMODE_VOICES` | `af_sky,alloy` | Kokoro voice (set via VoxType tray) |
 
 ## Troubleshooting
 
+### VoxType: First words get cut off
+This was fixed with mic pre-warming. If it still happens, check that the Electron app has microphone permissions in Windows Settings > Privacy > Microphone.
+
+### VoxType: LLM rewrites my words
+The enhancement prompt is designed to preserve your exact words. If it's still too aggressive, disable "LLM enhance" in the tray menu to get raw Whisper output.
+
 ### Services not starting
-Check if ports are already in use:
 ```powershell
 netstat -ano | findstr "6500 6600"
 ```
 
-### Kokoro keeps stopping
-Make sure you have **two separate** scheduled tasks (not one task with two actions). One combined task may kill both when either exits.
-
-### No audio output
-Check Windows sound settings and ensure the correct output device is selected.
-
-### Microphone not working
-Ensure microphone permissions are granted in Windows Settings > Privacy > Microphone.
-
-### Recording freezes
-Make sure the VAD resampling patch was applied:
-```powershell
-python patches\apply-patches.py "$env:USERPROFILE\.voicemode-windows\mcp-venv"
-```
-
 ### STT returns empty
-Try a larger Whisper model:
+Switch to a larger Whisper model via VoxType tray > Whisper model, or:
 ```powershell
 .\setup.ps1 -WhisperModel "Systran/faster-whisper-medium"
-```
-
-### Re-apply patches after voice-mode update
-```powershell
-python patches\apply-patches.py "$env:USERPROFILE\.voicemode-windows\mcp-venv"
 ```
 
 ## Uninstall
@@ -235,12 +163,15 @@ python patches\apply-patches.py "$env:USERPROFILE\.voicemode-windows\mcp-venv"
 .\uninstall.ps1
 ```
 
+Removes all scheduled tasks, VoxType data, and optionally the install directory.
+
 ## Credits
 
 - [VoiceMode](https://github.com/mbailey/voicemode) by Mike Bailey
 - [faster-whisper-server](https://github.com/fedirz/faster-whisper-server) by fedirz
 - [Kokoro-FastAPI](https://github.com/remsky/Kokoro-FastAPI) by remsky
 - [Claude Code](https://claude.ai/claude-code) by Anthropic
+- Inspired by [Wispr Flow](https://wisprflow.ai/)
 
 ## License
 

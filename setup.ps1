@@ -280,6 +280,63 @@ $configScript = Join-Path $PSScriptRoot "configure-claude.ps1"
 & $configScript -InstallDir $InstallDir -WhisperPort $WhisperPort -KokoroPort $KokoroPort
 Write-Ok "Claude Code configured"
 
+# --- Create scheduled tasks for STT + TTS ---
+Write-Step "Creating scheduled tasks for voice services"
+$taskScript = Join-Path $PSScriptRoot "create-scheduled-tasks.ps1"
+& $taskScript -InstallDir $InstallDir
+Write-Ok "Scheduled tasks created"
+
+# --- Setup VoxType dictation app ---
+Write-Step "Setting up VoxType dictation overlay"
+$voxTypeDir = Join-Path $PSScriptRoot "voxtype"
+if (Test-Path "$voxTypeDir\package.json") {
+    # Check for Node.js
+    $nodeExe = Get-Command node -ErrorAction SilentlyContinue
+    if ($nodeExe) {
+        Write-Ok "Node.js: $(node --version)"
+
+        # Install dependencies
+        Push-Location $voxTypeDir
+        Write-Host "    Installing npm dependencies..." -ForegroundColor DarkGray
+        npm install --quiet 2>&1 | Out-Null
+        if (Test-Path "node_modules\.bin\electron.cmd") {
+            Write-Ok "Dependencies installed"
+
+            # Build
+            Write-Host "    Building VoxType..." -ForegroundColor DarkGray
+            npx tsc -p tsconfig.node.json 2>&1 | Out-Null
+            npx vite build 2>&1 | Out-Null
+            if (Test-Path "dist\main\main\index.js") {
+                Write-Ok "VoxType built"
+
+                # Create scheduled task
+                & "$voxTypeDir\create-scheduled-task.ps1" -VoxTypePath $voxTypeDir
+                Write-Ok "VoxType scheduled task created"
+            } else {
+                Write-Warn "VoxType build failed — skipping auto-start setup"
+            }
+        } else {
+            Write-Warn "npm install failed — skipping VoxType setup"
+        }
+        Pop-Location
+    } else {
+        Write-Warn "Node.js not found — skipping VoxType setup. Install from https://nodejs.org"
+    }
+} else {
+    Write-Warn "VoxType directory not found — skipping"
+}
+
+# --- Start all services now ---
+Write-Step "Starting services"
+$tasksToStart = @("VoiceMode-Whisper-STT", "VoiceMode-Kokoro-TTS", "VoxType-Dictation")
+foreach ($task in $tasksToStart) {
+    $existing = Get-ScheduledTask -TaskName $task -ErrorAction SilentlyContinue
+    if ($existing) {
+        Start-ScheduledTask -TaskName $task -ErrorAction SilentlyContinue
+        Write-Ok "Started: $task"
+    }
+}
+
 # --- Summary ---
 Write-Host @"
 
@@ -287,16 +344,15 @@ Write-Host @"
   Setup Complete!
   ====================================================
 
-  Services:
-    Whisper STT : 127.0.0.1:$WhisperPort
-    Kokoro TTS  : 127.0.0.1:$KokoroPort
+  Services (auto-start on login):
+    Whisper STT  : 127.0.0.1:$WhisperPort
+    Kokoro TTS   : 127.0.0.1:$KokoroPort
+    VoxType      : Dictation overlay (Ctrl+Win)
 
-  Start services:
-    $InstallDir\start-whisper-stt.bat
-    $InstallDir\start-kokoro-tts.bat
+  All services are running and will auto-start on login.
 
-  Or use Task Scheduler (recommended):
-    $InstallDir\create-scheduled-tasks.ps1
+  VoxType: Press Ctrl+Win to dictate into any app.
+  Right-click tray icon for settings.
 
   Then restart Claude Code and use voice!
 
