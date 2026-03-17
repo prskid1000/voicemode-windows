@@ -28,6 +28,7 @@ if (Test-Path $whisperBat) {
         -ExecutionTimeLimit (New-TimeSpan -Hours 0) `
         -RestartCount 3 `
         -RestartInterval (New-TimeSpan -Minutes 1) `
+        -StartWhenAvailable `
         -Hidden
     $principal = New-ScheduledTaskPrincipal -UserId $username -LogonType S4U -RunLevel Limited
 
@@ -50,6 +51,7 @@ if (Test-Path $kokoroBat) {
         -ExecutionTimeLimit (New-TimeSpan -Hours 0) `
         -RestartCount 3 `
         -RestartInterval (New-TimeSpan -Minutes 1) `
+        -StartWhenAvailable `
         -Hidden
     $principal = New-ScheduledTaskPrincipal -UserId $username -LogonType S4U -RunLevel Limited
 

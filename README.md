@@ -78,6 +78,7 @@ $settings = New-ScheduledTaskSettingsSet `
     -ExecutionTimeLimit (New-TimeSpan -Hours 0) `
     -RestartCount 3 `
     -RestartInterval (New-TimeSpan -Minutes 1) `
+    -StartWhenAvailable `
     -Hidden
 $principal = New-ScheduledTaskPrincipal -UserId $user -LogonType S4U -RunLevel Limited
 Register-ScheduledTask -TaskName "VoiceMode-Whisper-STT" `
@@ -94,6 +95,7 @@ $settings = New-ScheduledTaskSettingsSet `
     -ExecutionTimeLimit (New-TimeSpan -Hours 0) `
     -RestartCount 3 `
     -RestartInterval (New-TimeSpan -Minutes 1) `
+    -StartWhenAvailable `
     -Hidden
 $principal = New-ScheduledTaskPrincipal -UserId $user -LogonType S4U -RunLevel Limited
 Register-ScheduledTask -TaskName "VoiceMode-Kokoro-TTS" `
@@ -127,6 +129,7 @@ schtasks /delete /tn VoiceMode-Kokoro-TTS /f
 | `-DontStopIfGoingOnBatteries` | true | Doesn't kill on unplug |
 | `-RestartCount 3` | 3 retries | Auto-restart on crash |
 | `-RestartInterval 1m` | 1 minute apart | Delay between retries |
+| `-StartWhenAvailable` | true | Run ASAP if missed trigger (e.g. PC was off) |
 
 ## Usage in Claude Code
 
