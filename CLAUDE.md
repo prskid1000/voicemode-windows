@@ -130,7 +130,7 @@ voicemode-windows/
 - **PyTorch installed separately**: Kokoro's `pyproject.toml` uses `[tool.uv.sources]` for CUDA index which pip doesn't understand.
 - **`claude mcp add` via CLI**: Never parse `.claude.json` directly.
 - **Three separate scheduled tasks**: VoiceMode-Whisper-STT, VoiceMode-Kokoro-TTS, VoxType-Dictation.
-- **S4U logon for services, Interactive for VoxType**: Services (Whisper/Kokoro) use S4U (no password, runs hidden). VoxType uses Interactive logon (needs user desktop for GUI).
+- **Interactive logon for all tasks**: All services use Interactive logon (runs when user is logged on). This allows VoxType to kill and restart Whisper/Kokoro processes when switching models. S4U was removed because its processes cannot be terminated by the user.
 - **VBS launcher for VoxType**: `start-voxtype.vbs` launches `electron.exe` directly (GUI binary at `node_modules/electron/dist/electron.exe`), bypassing `electron.cmd` which spawns a console window. The VBS itself runs silently via `wscript.exe`.
 - **Mic pre-warming**: getUserMedia() called once at app start, stream reused for instant recording (eliminates 3s mic startup delay).
 - **Transparent Electron window**: `enable-transparent-visuals` + `disable-gpu-compositing` flags for Windows.

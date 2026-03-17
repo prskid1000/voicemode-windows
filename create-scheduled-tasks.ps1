@@ -30,7 +30,7 @@ if (Test-Path $whisperBat) {
         -RestartInterval (New-TimeSpan -Minutes 1) `
         -StartWhenAvailable `
         -Hidden
-    $principal = New-ScheduledTaskPrincipal -UserId $username -LogonType S4U -RunLevel Limited
+    $principal = New-ScheduledTaskPrincipal -UserId $username -LogonType Interactive -RunLevel Limited
 
     Register-ScheduledTask -TaskName "VoiceMode-Whisper-STT" -Action $action -Trigger $trigger -Settings $settings -Principal $principal -Force | Out-Null
     if ($?) {
@@ -53,7 +53,7 @@ if (Test-Path $kokoroBat) {
         -RestartInterval (New-TimeSpan -Minutes 1) `
         -StartWhenAvailable `
         -Hidden
-    $principal = New-ScheduledTaskPrincipal -UserId $username -LogonType S4U -RunLevel Limited
+    $principal = New-ScheduledTaskPrincipal -UserId $username -LogonType Interactive -RunLevel Limited
 
     Register-ScheduledTask -TaskName "VoiceMode-Kokoro-TTS" -Action $action -Trigger $trigger -Settings $settings -Principal $principal -Force | Out-Null
     if ($?) {

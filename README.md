@@ -120,7 +120,7 @@ Setup creates three scheduled tasks automatically:
 | `VoiceMode-Kokoro-TTS` | Kokoro TTS server (port 6500) |
 | `VoxType-Dictation` | Dictation overlay app |
 
-All tasks run hidden, auto-restart on crash, no password required (S4U logon).
+All tasks run hidden, auto-restart on crash, auto-restart on crash, runs hidden (Interactive logon).
 
 ```powershell
 # Manual control
