@@ -21,6 +21,7 @@ export interface AppSettings {
   pillY: number;
   whisperUrl: string;
   lmStudioUrl: string;
+  llmModel: string;
 }
 
 export const DEFAULT_SETTINGS: AppSettings = {
@@ -35,6 +36,7 @@ export const DEFAULT_SETTINGS: AppSettings = {
   pillY: -1,
   whisperUrl: 'http://127.0.0.1:6600',
   lmStudioUrl: 'http://127.0.0.1:1234',
+  llmModel: '',
 };
 
 // IPC channel names

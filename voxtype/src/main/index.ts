@@ -180,7 +180,7 @@ app.whenReady().then(() => {
 
   // Fetch LLM models, then build tray (so model submenu is populated)
   ensureLMStudio(settings.lmStudioUrl)
-    .then(() => fetchModels(settings.lmStudioUrl))
+    .then(() => fetchModels(settings.lmStudioUrl, settings.llmModel))
     .catch(() => {})
     .finally(() => {
       if (mainWindow) createTray(mainWindow, () => settings, (partial) => { Object.assign(settings, partial); saveSettings(settings); });

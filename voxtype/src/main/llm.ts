@@ -87,14 +87,21 @@ function checkAlive(lmStudioUrl: string): Promise<boolean> {
   });
 }
 
-export async function fetchModels(lmStudioUrl: string): Promise<{ id: string; state: string }[]> {
+export async function fetchModels(lmStudioUrl: string, savedModel?: string): Promise<{ id: string; state: string }[]> {
   // Try v0 API first (all downloaded models with state)
   const v0 = await fetchV0Models(lmStudioUrl);
   if (v0.length > 0) {
     availableModels = v0;
+    const ids = v0.map(m => m.id);
     if (!cachedModel) {
-      cachedModel = pickSmallest(v0.map(m => m.id));
-      console.log(`[VoxType] Auto-selected smallest LLM: ${cachedModel}`);
+      // Use saved model if it exists in available models, otherwise pick smallest
+      if (savedModel && ids.includes(savedModel)) {
+        cachedModel = savedModel;
+        console.log(`[VoxType] Restored saved LLM model: ${cachedModel}`);
+      } else {
+        cachedModel = pickSmallest(ids);
+        console.log(`[VoxType] Auto-selected smallest LLM: ${cachedModel}${savedModel ? ` (saved "${savedModel}" not available)` : ''}`);
+      }
     }
     return availableModels;
   }
@@ -102,8 +109,13 @@ export async function fetchModels(lmStudioUrl: string): Promise<{ id: string; st
   const v1 = await fetchV1Models(lmStudioUrl);
   availableModels = v1.map(id => ({ id, state: 'loaded' }));
   if (!cachedModel && v1.length > 0) {
-    cachedModel = pickSmallest(v1);
-    console.log(`[VoxType] Auto-selected smallest LLM: ${cachedModel}`);
+    if (savedModel && v1.includes(savedModel)) {
+      cachedModel = savedModel;
+      console.log(`[VoxType] Restored saved LLM model: ${cachedModel}`);
+    } else {
+      cachedModel = pickSmallest(v1);
+      console.log(`[VoxType] Auto-selected smallest LLM: ${cachedModel}${savedModel ? ` (saved "${savedModel}" not available)` : ''}`);
+    }
   }
   return availableModels;
 }

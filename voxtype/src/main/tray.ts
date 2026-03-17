@@ -128,7 +128,7 @@ export function createTray(
             label: `${m.id}${m.state === 'loaded' ? ' (loaded)' : ''}`,
             type: 'radio' as const,
             checked: current === m.id,
-            click: () => { setLLMModel(m.id); rebuildMenu(); },
+            click: () => { setLLMModel(m.id); updateSettings({ llmModel: m.id }); rebuildMenu(); },
           }));
           items.push({ type: 'separator' });
           items.push({ label: 'Refresh models', click: async () => { await fetchModels(s.lmStudioUrl); rebuildMenu(); } });
