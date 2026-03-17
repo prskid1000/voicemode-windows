@@ -45,18 +45,19 @@ Press your hotkey (default: **Ctrl+Win**), speak, release — text appears at yo
 
 ### Features
 
-- **Instant recording** — mic pre-warmed, no startup delay
-- **LLM enhancement** — cleans up filler words, fixes punctuation, formats numbers via local LM Studio
-- **Auto-stop on silence** — stops recording after 2s of silence
-- **VAD noise gate** — skips sending empty audio to Whisper
-- **Custom hotkey** — any two-key combo (click "Hotkey" in tray to set)
-- **Whisper model selector** — switch between Tiny/Base/Small/Medium/Large v3 from tray
-- **Kokoro voice selector** — 15 featured voices for VoiceMode TTS
-- **Transcription history** — last 20 entries, click to copy from tray
-- **Append mode** — append text after cursor instead of replacing selection
-- **Multi-monitor** — pill follows cursor to the active display
-- **Draggable pill** — drag to reposition, position persists across restarts
-- **Minimal UI** — 28px orb with animated states, expands only during recording
+- **Instant recording** — mic stream is pre-warmed at app startup (`getUserMedia` called once), eliminating the 3-second delay that normally occurs on first recording
+- **Hold or toggle mode** — "Hold to talk" records while you hold the hotkey; "Toggle" records on first press, stops on second press
+- **Custom hotkey** — capture any two-key combo (e.g. Ctrl+Win, Alt+Space) by clicking "Hotkey" in tray and pressing your keys
+- **Whisper model switching** — select Tiny/Base/Small/Medium/Large v3 from tray; VoxType rewrites the `start-whisper-stt.bat` file with the new model name, kills the running `faster-whisper-server` process, and restarts the `VoiceMode-Whisper-STT` scheduled task — both VoxType dictation and Claude Code MCP use the same Whisper server
+- **Kokoro voice switching** — select from 15 curated voices; VoxType writes `VOICEMODE_VOICES=<voice_id>,alloy` to `~/.voicemode/voicemode.env` — the VoiceMode MCP server reads this file on each TTS call, so Claude Code's voice changes immediately without restart
+- **LLM enhancement** — after Whisper transcribes, the raw text is sent to LM Studio (`localhost:1234`) with an 11-rule system prompt + 10 examples to clean up fillers ("um", "like"), fix punctuation, format numbers/currency, and handle self-corrections — uses temperature 0 for deterministic output; auto-detects which model is loaded via `/v1/models`
+- **Auto-stop on silence** — monitors RMS energy level during recording; stops after 2 seconds of continuous silence
+- **VAD noise gate** — before sending audio to Whisper, checks if RMS energy exceeds threshold and duration is >0.3s; skips empty recordings to save Whisper processing time
+- **Append mode** — when enabled, saves clipboard content before pasting and restores it after, effectively appending text at cursor position; when disabled, replaces current selection
+- **Transcription history** — stores last 20 entries in `~/.voxtype/history.json` with timestamp, raw transcript, and enhanced version; click any entry in tray to copy to clipboard
+- **Multi-monitor** — pill overlay follows your cursor to whichever display is active
+- **Draggable pill** — drag to reposition anywhere on screen; position (`pillX`, `pillY`) persists in settings across restarts
+- **Minimal UI** — 28px transparent orb with animated states, expands to pill shape only during recording; uses `enable-transparent-visuals` + `disable-gpu-compositing` Electron flags for Windows transparency
 
 ### Pill States
 
@@ -73,22 +74,22 @@ Press your hotkey (default: **Ctrl+Win**), speak, release — text appears at yo
 
 Right-click the VoxType tray icon for full settings:
 
-| Setting | Type | Description |
-|---------|------|-------------|
-| Hold to talk | Radio | Record while hotkey is held |
-| Toggle on/off | Radio | Press to start, press again to stop |
-| Hotkey | Click | Capture a custom two-key combo (e.g. Ctrl+Win) |
-| Whisper model | Submenu | Tiny / Base / **Small** (default) / Medium / Large v3 — auto-restarts STT service |
-| Kokoro voice | Submenu | 15 voices — 7F American, 4M American, 2F British, 2M British |
-| LLM enhance | Toggle | Clean up filler words, punctuation via local LM Studio |
-| Append mode | Toggle | Append after cursor instead of replacing selection |
-| Auto-stop on silence | Toggle | Stop recording after 2s silence |
-| Skip silence (VAD) | Toggle | Don't send empty audio to Whisper |
-| Save history | Toggle | Store last 20 transcriptions |
-| History | Submenu | Click any entry to copy to clipboard, clear all |
-| Show/Hide pill | Click | Toggle the overlay orb |
-| Reset pill position | Click | Snap pill back to bottom-center |
-| Quit | Click | Exit VoxType |
+| Setting | Type | What it does |
+|---------|------|--------------|
+| Hold to talk | Radio | Record audio while you hold the hotkey down. Release to stop and transcribe. |
+| Toggle on/off | Radio | First press starts recording, second press stops. Good for longer dictation. |
+| Hotkey | Click | Enters capture mode — press any two keys together to set as your hotkey. Shows current combo (e.g. "Ctrl + LWin"). |
+| Whisper model | Submenu | Switches the STT model. Rewrites `start-whisper-stt.bat`, kills the running Whisper process, restarts the scheduled task. Affects both VoxType and Claude Code MCP (same Whisper server). |
+| Kokoro voice | Submenu | Switches the TTS voice for Claude Code's VoiceMode MCP. Writes `VOICEMODE_VOICES=<id>,alloy` to `~/.voicemode/voicemode.env`. Takes effect on next MCP TTS call — no restart needed. |
+| LLM enhance | Toggle | Sends raw Whisper transcript to LM Studio (localhost:1234) for cleanup. Removes filler words, fixes punctuation, formats numbers. Disable for raw Whisper output. |
+| Append mode | Toggle | ON: saves clipboard, pastes text, restores clipboard (appends at cursor). OFF: replaces current selection via Ctrl+V. |
+| Auto-stop on silence | Toggle | Monitors mic RMS energy. Stops recording after 2 seconds of continuous silence. |
+| Skip silence (VAD) | Toggle | Checks if recording has speech (RMS > threshold, duration > 0.3s). Skips empty recordings to avoid wasting Whisper processing time. |
+| Save history | Toggle | Stores transcriptions in `~/.voxtype/history.json` (last 20 entries with timestamp, raw, and enhanced text). |
+| History | Submenu | Shows last 10 entries with time. Click to copy enhanced text to clipboard. "Clear history" deletes all. |
+| Show/Hide pill | Click | Toggles the floating overlay orb on/off. |
+| Reset pill position | Click | Moves pill back to bottom-center of primary display. |
+| Quit | Click | Exits VoxType app. |
 
 **Whisper models** (selectable from tray):
 
@@ -138,9 +139,31 @@ schtasks /end /tn VoxType-Dictation
 After setup and restarting Claude Code:
 
 ```
-# Start a voice conversation
+# Start a voice conversation (TTS + STT)
 /mcp__voicemode__converse
 ```
+
+### How it works
+
+1. Claude speaks via **Kokoro TTS** (GPU-accelerated, ~1s generation)
+2. Your mic records with **VAD silence detection** (auto-stops when you go quiet)
+3. Audio transcribed via **local Whisper STT** (~0.5-1s)
+4. Transcribed text returned to Claude as your response
+
+### Modes
+
+| Mode | How | Use case |
+|------|-----|----------|
+| Full conversation | `converse("Hello!", wait_for_response=true)` | Two-way voice chat |
+| TTS only | `converse("Hello!", wait_for_response=false)` | Claude speaks, no mic |
+| STT only | `converse("", skip_tts=true, wait_for_response=true)` | Mic only, no speech |
+
+### Shared services
+
+VoxType and Claude Code MCP share the same Whisper and Kokoro servers:
+- Switching Whisper model in VoxType tray changes it for Claude Code too
+- Switching Kokoro voice in VoxType tray changes Claude Code's TTS voice
+- Both use `localhost:6600` (STT) and `localhost:6500` (TTS)
 
 ## Architecture
 
