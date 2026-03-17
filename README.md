@@ -71,16 +71,43 @@ Press your hotkey (default: **Ctrl+Win**), speak, release — text appears at yo
 
 ### Tray Menu
 
-Right-click the VoxType tray icon for settings:
-- Recording mode (hold / toggle)
-- Hotkey customization
-- Whisper model selection (restarts service automatically)
-- Kokoro voice selection
-- LLM enhance toggle
-- Append mode
-- Auto-stop on silence
-- VAD noise gate
-- History with copy-to-clipboard
+Right-click the VoxType tray icon for full settings:
+
+| Setting | Type | Description |
+|---------|------|-------------|
+| Hold to talk | Radio | Record while hotkey is held |
+| Toggle on/off | Radio | Press to start, press again to stop |
+| Hotkey | Click | Capture a custom two-key combo (e.g. Ctrl+Win) |
+| Whisper model | Submenu | Tiny / Base / **Small** (default) / Medium / Large v3 — auto-restarts STT service |
+| Kokoro voice | Submenu | 15 voices — 7F American, 4M American, 2F British, 2M British |
+| LLM enhance | Toggle | Clean up filler words, punctuation via local LM Studio |
+| Append mode | Toggle | Append after cursor instead of replacing selection |
+| Auto-stop on silence | Toggle | Stop recording after 2s silence |
+| Skip silence (VAD) | Toggle | Don't send empty audio to Whisper |
+| Save history | Toggle | Store last 20 transcriptions |
+| History | Submenu | Click any entry to copy to clipboard, clear all |
+| Show/Hide pill | Click | Toggle the overlay orb |
+| Reset pill position | Click | Snap pill back to bottom-center |
+| Quit | Click | Exit VoxType |
+
+**Whisper models** (selectable from tray):
+
+| Model | Speed | Accuracy | VRAM |
+|-------|-------|----------|------|
+| Tiny | Fastest | Basic | ~1GB |
+| Base | Fast | Good | ~1GB |
+| Small | Balanced | Great | ~2GB |
+| Medium | Slower | Better | ~5GB |
+| Large v3 | Slowest | Best | ~10GB |
+
+**Kokoro voices** (selectable from tray):
+
+| Voice | Gender | Accent |
+|-------|--------|--------|
+| Sky, Heart, Bella, Nova, Sarah, Nicole, Jessica | Female | American |
+| Adam, Michael, Eric, Liam | Male | American |
+| Emma, Alice | Female | British |
+| George, Daniel | Male | British |
 
 ## Auto-Start (Task Scheduler)
 
