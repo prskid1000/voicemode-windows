@@ -184,7 +184,7 @@ async function fetchModels(lmStudioUrl, savedModel) {
 }
 function fetchV0Models(lmStudioUrl) {
     const base = new URL(lmStudioUrl);
-    const url = new URL('/api/v0/models', `${base.protocol}//${base.host}`);
+    const url = new URL('/api/v1/models', `${base.protocol}//${base.host}`);
     return new Promise((resolve) => {
         const transport = url.protocol === 'https:' ? https_1.default : http_1.default;
         const req = transport.request(url, { method: 'GET', timeout: 5000 }, (res) => {
