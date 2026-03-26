@@ -23,6 +23,7 @@ export interface AppSettings {
   lmStudioUrl: string;
   llmModel: string;
   preloadModel: boolean;
+  autoUnloadMinutes: number;
 }
 
 export const DEFAULT_SETTINGS: AppSettings = {
@@ -39,6 +40,7 @@ export const DEFAULT_SETTINGS: AppSettings = {
   lmStudioUrl: 'http://127.0.0.1:1234',
   llmModel: '',
   preloadModel: true,
+  autoUnloadMinutes: 0,
 };
 
 // IPC channel names

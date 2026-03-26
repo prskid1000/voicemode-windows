@@ -4,7 +4,7 @@ import fs from 'fs';
 import os from 'os';
 import { startHotkeyListener, stopHotkeyListener, setHotkeyMode, setHotkeyCombo } from './hotkey';
 import { transcribe, preloadWhisper } from './stt';
-import { enhance, fetchModels, ensureLMStudio, preloadCurrentModel } from './llm';
+import { enhance, fetchModels, ensureLMStudio, preloadCurrentModel, resetAutoUnloadTimer, stopAutoUnloadTimer } from './llm';
 import { typeText } from './typer';
 import { createTray } from './tray';
 import { hasSpeech, estimateDuration } from './vad';
@@ -153,6 +153,11 @@ async function handleAudioData(_event: Electron.IpcMainEvent, audioBuffer: Buffe
     await typeText(finalText, settings.appendMode);
 
     sendState('idle');
+
+    // Reset auto-unload timer after each successful use
+    if (settings.autoUnloadMinutes > 0) {
+      resetAutoUnloadTimer(settings.autoUnloadMinutes, settings.lmStudioUrl, settings.whisperUrl);
+    }
   } catch (err) {
     const msg = err instanceof Error ? err.message : String(err);
     console.error('Pipeline error:', msg);
@@ -191,6 +196,10 @@ app.whenReady().then(() => {
     .catch(() => {})
     .finally(() => {
       if (mainWindow) createTray(mainWindow, () => settings, (partial) => { Object.assign(settings, partial); saveSettings(settings); });
+      // Start auto-unload timer if configured
+      if (settings.autoUnloadMinutes > 0) {
+        resetAutoUnloadTimer(settings.autoUnloadMinutes, settings.lmStudioUrl, settings.whisperUrl);
+      }
     });
 
   // Hotkey listener

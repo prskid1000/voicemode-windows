@@ -9,6 +9,9 @@ exports.setLLMModel = setLLMModel;
 exports.ensureLMStudio = ensureLMStudio;
 exports.fetchModels = fetchModels;
 exports.preloadCurrentModel = preloadCurrentModel;
+exports.unloadCurrentModel = unloadCurrentModel;
+exports.resetAutoUnloadTimer = resetAutoUnloadTimer;
+exports.stopAutoUnloadTimer = stopAutoUnloadTimer;
 exports.enhance = enhance;
 const http_1 = __importDefault(require("http"));
 const https_1 = __importDefault(require("https"));
@@ -237,6 +240,58 @@ function pickSmallest(modelIds) {
         return (aMatch ? parseFloat(aMatch[1]) : 999) - (bMatch ? parseFloat(bMatch[1]) : 999);
     });
     return sorted[0];
+}
+// ─── Auto-unload: unload LLM model after idle timeout ────────────────
+let autoUnloadTimeout = null;
+let autoUnloadCallback = null;
+function unloadCurrentModel(lmStudioUrl) {
+    const model = cachedModel;
+    if (!model) return Promise.resolve();
+    console.log(`[VoxType] Unloading LLM model: ${model}`);
+    const base = new URL(lmStudioUrl);
+    const url = new URL(`/api/v0/models/unload`, `${base.protocol}//${base.host}`);
+    const payload = JSON.stringify({ model });
+    return new Promise((resolve) => {
+        const transport = url.protocol === 'https:' ? https_1.default : http_1.default;
+        const req = transport.request(url, {
+            method: 'POST',
+            timeout: 5000,
+            headers: { 'Content-Type': 'application/json', 'Content-Length': Buffer.byteLength(payload) },
+        }, (res) => {
+            res.resume();
+            if (res.statusCode === 200) {
+                console.log(`[VoxType] LLM model unloaded: ${model}`);
+            } else {
+                console.log(`[VoxType] LLM unload returned ${res.statusCode}`);
+            }
+            resolve();
+        });
+        req.on('error', (e) => { console.log(`[VoxType] LLM unload failed: ${e.message}`); resolve(); });
+        req.on('timeout', () => { req.destroy(); resolve(); });
+        req.write(payload);
+        req.end();
+    });
+}
+function resetAutoUnloadTimer(minutes, lmStudioUrl, whisperUrl, onUnload) {
+    if (autoUnloadTimeout) clearTimeout(autoUnloadTimeout);
+    autoUnloadTimeout = null;
+    if (!minutes || minutes <= 0) return;
+    autoUnloadCallback = onUnload || null;
+    autoUnloadTimeout = setTimeout(async () => {
+        console.log(`[VoxType] Auto-unload: ${minutes}min idle, unloading models...`);
+        await unloadCurrentModel(lmStudioUrl);
+        if (whisperUrl) {
+            try {
+                const { unloadWhisper } = require('./stt');
+                await unloadWhisper(whisperUrl);
+            } catch (e) {}
+        }
+        if (autoUnloadCallback) autoUnloadCallback();
+    }, minutes * 60 * 1000);
+}
+function stopAutoUnloadTimer() {
+    if (autoUnloadTimeout) clearTimeout(autoUnloadTimeout);
+    autoUnloadTimeout = null;
 }
 // ─── Preload: send a dummy request to warm up the selected model ─────
 async function preloadCurrentModel(lmStudioUrl) {

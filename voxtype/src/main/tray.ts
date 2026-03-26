@@ -5,7 +5,7 @@ import { setHotkeyMode, setHotkeyCombo, captureHotkey } from './hotkey';
 import { getEntries, clearHistory } from './history';
 import { WHISPER_MODELS, getCurrentModel, switchModel } from './whisper-model';
 import { FEATURED_VOICES, getCurrentVoice, setVoice } from './kokoro-voice';
-import { getAvailableModels, getCurrentLLMModel, setLLMModel, fetchModels, preloadCurrentModel } from './llm';
+import { getAvailableModels, getCurrentLLMModel, setLLMModel, fetchModels, preloadCurrentModel, resetAutoUnloadTimer, stopAutoUnloadTimer } from './llm';
 
 let tray: Tray | null = null;
 
@@ -118,9 +118,25 @@ export function createTray(
         submenu: (() => {
           const models = getAvailableModels();
           const current = getCurrentLLMModel();
+          const unloadOptions = [0, 5, 10, 15, 30, 60];
+          const unloadSubmenu: Electron.MenuItemConstructorOptions[] = unloadOptions.map((mins) => ({
+            label: mins === 0 ? 'Disabled' : `${mins} min`,
+            type: 'radio' as const,
+            checked: s.autoUnloadMinutes === mins,
+            click: () => {
+              updateSettings({ autoUnloadMinutes: mins });
+              if (mins > 0) {
+                resetAutoUnloadTimer(mins, s.lmStudioUrl, s.whisperUrl);
+              } else {
+                stopAutoUnloadTimer();
+              }
+              rebuildMenu();
+            },
+          }));
           if (models.length === 0) {
             return [
               { label: 'No models found', enabled: false },
+              { label: 'Auto-unload after', submenu: unloadSubmenu },
               { label: 'Preload on startup', type: 'checkbox' as const, checked: s.preloadModel, click: (item: any) => { updateSettings({ preloadModel: item.checked }); rebuildMenu(); } },
               { label: 'Refresh', click: async () => { await fetchModels(s.lmStudioUrl); rebuildMenu(); } },
             ];
@@ -132,6 +148,7 @@ export function createTray(
             click: () => { setLLMModel(m.id); updateSettings({ llmModel: m.id }); rebuildMenu(); },
           }));
           items.push({ type: 'separator' });
+          items.push({ label: 'Auto-unload after', submenu: unloadSubmenu });
           items.push({ label: 'Preload on startup', type: 'checkbox' as const, checked: s.preloadModel, click: (item: any) => { updateSettings({ preloadModel: item.checked }); rebuildMenu(); } });
           items.push({ label: 'Refresh models', click: async () => { await fetchModels(s.lmStudioUrl); rebuildMenu(); } });
           return items;

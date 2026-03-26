@@ -1,5 +1,6 @@
 import http from 'http';
 import https from 'https';
+import { execSync } from 'child_process';
 
 // Generate a minimal valid WAV file (0.1s silence, 16kHz mono 16-bit)
 function silentWav(): Buffer {
@@ -21,6 +22,16 @@ function silentWav(): Buffer {
   buf.write('data', 36);
   buf.writeUInt32LE(dataSize, 40);
   return buf;
+}
+
+export async function unloadWhisper(whisperUrl: string): Promise<void> {
+  console.log('[VoxType] Unloading Whisper (killing faster-whisper-server)...');
+  try {
+    execSync('taskkill /IM faster-whisper-server.exe /F', { timeout: 5000, stdio: 'ignore' });
+    console.log('[VoxType] Whisper process killed');
+  } catch {
+    console.log('[VoxType] Whisper process not running or already stopped');
+  }
 }
 
 export async function preloadWhisper(whisperUrl: string): Promise<void> {
