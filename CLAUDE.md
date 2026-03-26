@@ -100,6 +100,7 @@ voicemode-windows/
 | Whisper model | Tiny/Base/Small/Medium/Large v3 (restarts service) |
 | Kokoro voice | 15 featured voices (writes to voicemode.env) |
 | LLM enhance | Toggle post-processing via LM Studio |
+| LLM model → Preload on startup | Warm-up selected model at launch (sends dummy request) |
 | Append mode | Append text after cursor vs replace selection |
 | Auto-stop on silence | Stop recording after 2s silence |
 | Skip silence (VAD) | Skip sending empty audio to Whisper |

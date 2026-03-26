@@ -8,6 +8,7 @@ exports.getCurrentLLMModel = getCurrentLLMModel;
 exports.setLLMModel = setLLMModel;
 exports.ensureLMStudio = ensureLMStudio;
 exports.fetchModels = fetchModels;
+exports.preloadCurrentModel = preloadCurrentModel;
 exports.enhance = enhance;
 const http_1 = __importDefault(require("http"));
 const https_1 = __importDefault(require("https"));
@@ -106,22 +107,28 @@ function setLLMModel(modelId) {
     console.log(`[VoxType] LLM model set to: ${modelId}`);
 }
 async function ensureLMStudio(lmStudioUrl) {
-    const alive = await checkAlive(lmStudioUrl);
-    if (alive)
-        return true;
+    // Phase 1: poll up to 5 times (LM Studio may already be starting)
+    for (let i = 0; i < 5; i++) {
+        if (await checkAlive(lmStudioUrl)) return true;
+        if (i === 0) console.log('[VoxType] Waiting for LM Studio...');
+        await new Promise(r => setTimeout(r, 1000));
+    }
+    // Phase 2: try starting via CLI
     console.log('[VoxType] LM Studio not running, attempting to start via lms CLI...');
     try {
         (0, child_process_1.execSync)('lms server start', { timeout: 15000, stdio: 'ignore' });
-        for (let i = 0; i < 10; i++) {
-            await new Promise(r => setTimeout(r, 1000));
-            if (await checkAlive(lmStudioUrl)) {
-                console.log('[VoxType] LM Studio started successfully');
-                return true;
-            }
-        }
     }
     catch (e) {
         console.log('[VoxType] Could not start LM Studio:', e);
+        return false;
+    }
+    // Phase 3: poll up to 2 more times after starting
+    for (let i = 0; i < 2; i++) {
+        await new Promise(r => setTimeout(r, 1000));
+        if (await checkAlive(lmStudioUrl)) {
+            console.log('[VoxType] LM Studio started successfully');
+            return true;
+        }
     }
     return false;
 }
@@ -230,6 +237,25 @@ function pickSmallest(modelIds) {
         return (aMatch ? parseFloat(aMatch[1]) : 999) - (bMatch ? parseFloat(bMatch[1]) : 999);
     });
     return sorted[0];
+}
+// ─── Preload: send a dummy request to warm up the selected model ─────
+async function preloadCurrentModel(lmStudioUrl) {
+    const model = cachedModel || pickSmallest(availableModels.map(m => m.id));
+    if (!model) return;
+    console.log(`[VoxType] Preloading model: ${model}`);
+    const url = new URL('/v1/chat/completions', lmStudioUrl);
+    const payload = JSON.stringify({
+        model,
+        messages: [{ role: 'user', content: 'Hi' }],
+        temperature: 0,
+        max_tokens: 1,
+    });
+    try {
+        await callLLM(url, payload);
+        console.log(`[VoxType] Model preloaded: ${model}`);
+    } catch (e) {
+        console.log(`[VoxType] Model preload failed (non-fatal): ${e.message}`);
+    }
 }
 // ─── Robust post-processing: strip LLM artifacts ────────────────────
 function cleanLLMOutput(content, originalTranscript) {

@@ -22,6 +22,7 @@ export interface AppSettings {
   whisperUrl: string;
   lmStudioUrl: string;
   llmModel: string;
+  preloadModel: boolean;
 }
 
 export const DEFAULT_SETTINGS: AppSettings = {
@@ -37,6 +38,7 @@ export const DEFAULT_SETTINGS: AppSettings = {
   whisperUrl: 'http://127.0.0.1:6600',
   lmStudioUrl: 'http://127.0.0.1:1234',
   llmModel: '',
+  preloadModel: true,
 };
 
 // IPC channel names

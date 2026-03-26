@@ -5,7 +5,7 @@ import { setHotkeyMode, setHotkeyCombo, captureHotkey } from './hotkey';
 import { getEntries, clearHistory } from './history';
 import { WHISPER_MODELS, getCurrentModel, switchModel } from './whisper-model';
 import { FEATURED_VOICES, getCurrentVoice, setVoice } from './kokoro-voice';
-import { getAvailableModels, getCurrentLLMModel, setLLMModel, fetchModels } from './llm';
+import { getAvailableModels, getCurrentLLMModel, setLLMModel, fetchModels, preloadCurrentModel } from './llm';
 
 let tray: Tray | null = null;
 
@@ -121,6 +121,7 @@ export function createTray(
           if (models.length === 0) {
             return [
               { label: 'No models found', enabled: false },
+              { label: 'Preload on startup', type: 'checkbox' as const, checked: s.preloadModel, click: (item: any) => { updateSettings({ preloadModel: item.checked }); rebuildMenu(); } },
               { label: 'Refresh', click: async () => { await fetchModels(s.lmStudioUrl); rebuildMenu(); } },
             ];
           }
@@ -131,6 +132,7 @@ export function createTray(
             click: () => { setLLMModel(m.id); updateSettings({ llmModel: m.id }); rebuildMenu(); },
           }));
           items.push({ type: 'separator' });
+          items.push({ label: 'Preload on startup', type: 'checkbox' as const, checked: s.preloadModel, click: (item: any) => { updateSettings({ preloadModel: item.checked }); rebuildMenu(); } });
           items.push({ label: 'Refresh models', click: async () => { await fetchModels(s.lmStudioUrl); rebuildMenu(); } });
           return items;
         })(),
