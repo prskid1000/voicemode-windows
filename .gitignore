@@ -9,3 +9,9 @@ node_modules/
 voxtype/dist/
 voxtype/node_modules/
 package-lock.json
+
+# Runtime dirs (created by setup.ps1)
+mcp-venv/
+stt-venv/
+tts-venv/
+Kokoro-FastAPI/
