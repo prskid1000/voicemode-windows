@@ -1,217 +1,159 @@
-# VoiceMode Windows
+# VoxType
 
-Local voice input/output for [Claude Code](https://claude.ai/claude-code) on Windows. Fully offline STT (Whisper) + TTS (Kokoro) with GPU acceleration.
+Local voice dictation overlay for Windows. Press a hotkey, speak, release — text appears at your cursor in any app.
 
-Includes **VoxType** — a local Wispr Flow alternative that lets you dictate into any Windows app with a global hotkey.
+A self-hosted [Wispr Flow](https://wisprflow.ai) alternative. Everything runs on your machine: speech-to-text via [faster-whisper-server](https://github.com/fedirz/faster-whisper-server), optional cleanup via any local LLM in [LM Studio](https://lmstudio.ai), and (optional) TTS via [Kokoro-FastAPI](https://github.com/remsky/Kokoro-FastAPI). No cloud, no telemetry.
 
-## What it does
+VoxType is a single Electron app that **owns** the Whisper and Kokoro child processes — they spawn when VoxType starts and die when it quits. One scheduled task, one tray icon, no per-service wrappers.
 
-- **Speech-to-Text**: Local [faster-whisper-server](https://github.com/fedirz/faster-whisper-server) with OpenAI-compatible API
-- **Text-to-Speech**: Local [Kokoro-FastAPI](https://github.com/remsky/Kokoro-FastAPI) with GPU support
-- **MCP Integration**: Patched [VoiceMode](https://github.com/mbailey/voicemode) MCP server for Windows
-- **VoxType Dictation**: Electron overlay app — press hotkey, speak, text appears at cursor
-- **No cloud APIs**: Everything runs locally, full privacy
-- **Auto-start**: Task Scheduler integration for boot-time startup (hidden, no console window)
-
-## Prerequisites
-
-- Windows 10/11
-- Python 3.10+ (3.12 recommended)
-- Node.js 18+ (for VoxType)
-- Git
-- ffmpeg (in PATH)
-- NVIDIA GPU (optional, for Kokoro TTS acceleration)
-- [Claude Code](https://claude.ai/claude-code) installed
-- [LM Studio](https://lmstudio.ai/) with any model loaded (for VoxType enhancement, optional)
-
-## Quick Start
+## Quick start
 
 ```powershell
-git clone https://github.com/prskid1000/voicemode-windows.git
-cd voicemode-windows
+git clone https://github.com/prskid1000/voicemode-windows.git "$env:USERPROFILE\.voicemode-windows"
+cd "$env:USERPROFILE\.voicemode-windows"
 .\setup.ps1
 ```
 
 Setup will:
-1. Install VoiceMode MCP with Windows patches
-2. Install Whisper STT + Kokoro TTS services
-3. Build and install VoxType dictation app
-4. Create scheduled tasks for all 3 services
-5. Start everything immediately
+1. Install Whisper STT (`stt-venv`)
+2. Install Kokoro TTS (`tts-venv` + Kokoro-FastAPI clone + 313 MB model) — skip with `-SkipKokoro`
+3. Build the VoxType Electron app in place
+4. Register a single scheduled task `VoxType-Dictation` that auto-starts at logon
+5. Start VoxType immediately
 
-## VoxType — Voice Dictation
+That's it. Look for the tray icon, press **Ctrl+Win**, speak, release.
 
-Press your hotkey (default: **Ctrl+Win**), speak, release — text appears at your cursor in any app.
+## Prerequisites
 
-### Features
+| Dependency | Why |
+|---|---|
+| Windows 10 / 11 | Target OS |
+| Python 3.10+ | Whisper + Kokoro venvs |
+| Node.js 18+ | Build VoxType (Electron) |
+| Git | Clone Kokoro-FastAPI |
+| ffmpeg (optional) | Some audio codecs |
+| NVIDIA GPU + CUDA | Strongly recommended for Kokoro; Whisper works on CPU |
+| [LM Studio](https://lmstudio.ai) (optional) | LLM cleanup of raw transcripts |
 
-- **Instant recording** — mic stream is pre-warmed at app startup (`getUserMedia` called once), eliminating the 3-second delay that normally occurs on first recording
-- **Hold or toggle mode** — "Hold to talk" records while you hold the hotkey; "Toggle" records on first press, stops on second press
-- **Custom hotkey** — set a custom binding via the tray: (1) click "Hotkey: …" — menu closes and capture mode starts; (2) release every key so capture arms; (3) press your desired binding — one key alone (e.g. F9) or two keys together (e.g. Ctrl+Space); (4) release. Capture waits for a fully-released keyboard before listening, so tray/menu keystrokes don't leak in
-- **Whisper model switching** — select Tiny/Base/Small/Medium/Large v3 from tray; VoxType rewrites the `start-whisper-stt.bat` file with the new model name, kills the running `faster-whisper-server` process, and restarts the `VoiceMode-Whisper-STT` scheduled task — both VoxType dictation and Claude Code MCP use the same Whisper server
-- **Kokoro voice switching** — select from 15 curated voices; VoxType writes `VOICEMODE_VOICES=<voice_id>,alloy` to `~/.voicemode/voicemode.env` — the VoiceMode MCP server reads this file on each TTS call, so Claude Code's voice changes immediately without restart
-- **LLM enhancement** — after Whisper transcribes, the raw text is sent to LM Studio (`localhost:1234`) with an 11-rule system prompt + 10 examples to clean up fillers ("um", "like"), fix punctuation, format numbers/currency, and handle self-corrections — uses temperature 0 for deterministic output; auto-detects which model is loaded via `/v1/models`
-- **Model preload** — on startup, sends a dummy silent WAV to Whisper, a short TTS request to Kokoro, and a dummy "Hi" request to LM Studio — all three in parallel, so every model is loaded and warm before first dictation; disable in tray to skip startup entirely for instant launch
-- **Auto-unload after idle** — configurable timer (5/10/15/30/60 min) that unloads all three models after no dictation activity, freeing VRAM: unloads the LLM model (via LM Studio API), kills the Whisper process, and kills the Kokoro TTS process; both the Whisper and Kokoro scheduled tasks are restarted so servers stay ready without models loaded
-- **Auto-stop on silence** — monitors RMS energy level during recording; stops after 2 seconds of continuous silence
-- **VAD noise gate** — before sending audio to Whisper, checks if RMS energy exceeds threshold and duration is >0.3s; skips empty recordings to save Whisper processing time
-- **Append mode** — when enabled, saves clipboard content before pasting and restores it after, effectively appending text at cursor position; when disabled, replaces current selection
-- **Transcription history** — stores last 20 entries in `~/.voxtype/history.json` with timestamp, raw transcript, and enhanced version; click any entry in tray to copy to clipboard
-- **Multi-monitor** — pill overlay follows your cursor to whichever display is active
-- **Draggable pill** — drag to reposition anywhere on screen; position (`pillX`, `pillY`) persists in settings across restarts
-- **Minimal UI** — 28px transparent orb with animated states, expands to pill shape only during recording; uses `enable-transparent-visuals` + `disable-gpu-compositing` Electron flags for Windows transparency
+## How it works
 
-### Pill States
+```
+                  Scheduled Task: VoxType-Dictation
+                              │
+                              ▼
+                    electron.exe → VoxType
+                    │                    │
+                    ▼                    ▼
+              spawns child         spawns child       (external)
+              ┌──────────┐       ┌──────────┐       ┌──────────┐
+              │ Whisper  │       │  Kokoro  │       │ LM Studio│
+              │   :6600  │       │   :6500  │       │  :1234   │
+              └──────────┘       └──────────┘       └──────────┘
+```
 
-| State | Visual |
-|-------|--------|
-| Idle | Dark orb with breathing aurora glow |
-| Recording | Red pill with pulsing dot + live waveform |
-| Transcribing | Orb with amber spinner |
-| Enhancing | Orb with indigo sparkle |
-| Done | Orb with green checkmark |
-| Error | Orb with red lightning bolt |
+VoxType is the parent. It launches Whisper (always, by default) and Kokoro (off by default — toggle from tray) as children, healthchecks them, restarts them on crash, and kills them cleanly when you quit. LM Studio is the only thing VoxType does not manage — it's a separate user app you launch yourself.
 
-### Tray Menu
+## VoxType pipeline
 
-Right-click the VoxType tray icon for full settings:
+1. **Hotkey down** → start recording (mic stream pre-warmed at app start, no cold-start delay)
+2. **Hotkey up** (or 2 s of silence in toggle mode) → audio sent to Whisper
+3. **VAD gate** drops empty/silent recordings before they hit Whisper
+4. **Transcription** returned (~0.5–1 s for 3 s of audio on a small model)
+5. **LLM enhance** (optional) — raw transcript + screenshot of the active display + cursor marker sent to LM Studio with a structured-output schema; cleaned text returned
+6. **Type at cursor** via clipboard → `Ctrl+V` (works in every Windows app)
 
-| Setting | Type | What it does |
-|---------|------|--------------|
-| Hold to talk | Radio | Record audio while you hold the hotkey down. Release to stop and transcribe. |
-| Toggle on/off | Radio | First press starts recording, second press stops. Good for longer dictation. |
-| Hotkey | Click | Click to enter capture mode (menu closes). Then release every key so capture arms, press your binding — one key alone (e.g. F9) or two keys together (e.g. Ctrl+Space) — and release. Capture waits for a fully-released keyboard before listening so menu accelerators don't leak in. Shows current binding (e.g. "Ctrl + LWin" or "F9"). |
-| Whisper model | Submenu | Switches the STT model. Rewrites `start-whisper-stt.bat`, kills the running Whisper process, restarts the scheduled task. Affects both VoxType and Claude Code MCP (same Whisper server). |
-| Kokoro voice | Submenu | Switches the TTS voice for Claude Code's VoiceMode MCP. Writes `VOICEMODE_VOICES=<id>,alloy` to `~/.voicemode/voicemode.env`. Takes effect on next MCP TTS call — no restart needed. |
-| LLM enhance | Toggle | Sends raw Whisper transcript to LM Studio (localhost:1234) for cleanup. Removes filler words, fixes punctuation, formats numbers. Disable for raw Whisper output. |
-| LLM model | Submenu | Select which LM Studio model to use. Shows all downloaded models with load state. Auto-selects smallest by parameter count. |
-| → Auto-unload after | Submenu | Unload all models (Whisper + LLM + Kokoro) after idle time (Disabled/5/10/15/30/60 min). Frees VRAM when not dictating. Timer resets after each use. |
-| → Preload on startup | Toggle | Warm up Whisper (silent WAV) + Kokoro (short TTS) + LLM (dummy request) at launch in parallel. Disable to skip all preloading on startup. |
-| → Refresh models | Click | Re-fetch model list from LM Studio. |
-| Append mode | Toggle | ON: saves clipboard, pastes text, restores clipboard (appends at cursor). OFF: replaces current selection via Ctrl+V. |
-| Auto-stop on silence | Toggle | Monitors mic RMS energy. Stops recording after 2 seconds of continuous silence. |
-| Skip silence (VAD) | Toggle | Checks if recording has speech (RMS > threshold, duration > 0.3s). Skips empty recordings to avoid wasting Whisper processing time. |
-| Save history | Toggle | Stores transcriptions in `~/.voxtype/history.json` (last 20 entries with timestamp, raw, and enhanced text). |
-| History | Submenu | Shows last 10 entries with time. Click to copy enhanced text to clipboard. "Clear history" deletes all. |
-| Show/Hide pill | Click | Toggles the floating overlay orb on/off. |
-| Reset pill position | Click | Moves pill back to bottom-center of primary display. |
-| Quit | Click | Exits VoxType app. |
+## Tray menu
 
-**Whisper models** (selectable from tray):
+```
+VoxType
+├─ ◉ Hold to talk
+├─ ◉ Toggle on/off
+├─ Hotkey: Ctrl+Win              (click to rebind — single key like F9 also OK)
+├─ Services
+│   ├─ Whisper (STT) — ● ready
+│   │   ├─ ☑ Enabled
+│   │   ├─ Model: Tiny / Base / Small / Medium / Large v3
+│   │   ├─ Device: GPU / CPU
+│   │   └─ Restart now
+│   ├─ Kokoro (TTS) — ○ off
+│   │   ├─ ☐ Enabled
+│   │   ├─ Voice: 15 curated voices
+│   │   ├─ Device: GPU / CPU
+│   │   └─ Restart now
+│   └─ LM Studio (LLM)
+│       ├─ ☑ Enhance transcript
+│       ├─ ☑ Screen context (vision)
+│       ├─ Model: (auto-detected)
+│       ├─ Auto-unload after: Off / 5 / 10 / 15 / 30 / 60 min
+│       ├─ ☑ Preload on startup
+│       └─ Refresh models
+├─ Recording
+│   ├─ ☑ Auto-stop on silence
+│   ├─ ☑ Skip silence (VAD)
+│   └─ ☐ Append mode (preserve clipboard)
+├─ History
+│   ├─ ☑ Save history
+│   └─ Recent (last 10 — click to copy)
+├─ Pill
+│   ├─ Show / Hide pill
+│   └─ Reset position
+└─ Quit
+```
+
+Status badges (`● ready` / `… starting` / `○ off`) refresh every 5 seconds.
+
+## LLM enhancement (optional)
+
+If LM Studio is running on `http://127.0.0.1:1234` with any model loaded, VoxType will send the raw Whisper transcript + a screenshot of your active display (with a red marker drawn at the cursor) to the LLM with a JSON-schema-constrained structured response:
+
+```json
+{
+  "screen_context": "≤200 chars — active app + general UI",
+  "cursor_focus":   "≤150 chars — what's at the red cursor marker",
+  "edit_plan":      "≤300 chars — terse bullets of the edits applied",
+  "output":         "the cleaned transcript (only field shown to user)"
+}
+```
+
+The system prompt lives in [`voxtype/resources/system-prompt.md`](voxtype/resources/system-prompt.md) — edit it freely, no rebuild needed (read fresh on every call).
+
+Vision-capable models (e.g. Qwen2.5-VL, Llama 3.2 Vision) get the screenshot to disambiguate names like "this function", "rename this to foo", correct casing of identifiers visible on screen, etc. Text-only models still work; they just ignore the image.
+
+Disable from tray > Services > LM Studio if you want raw Whisper output.
+
+## Logs and data
+
+Everything VoxType writes lives under `~/.voxtype/`:
+
+| File | Purpose | Lifecycle |
+|---|---|---|
+| `settings.json` | All tray settings | Persistent |
+| `history.json` | Last 20 dictations (raw + enhanced) | Persistent — shown in tray |
+| `debug.log` | Full main-process stdout/stderr (incl. Whisper/Kokoro child output) | **Truncated on every launch** |
+| `sessions.jsonl` | One JSON per dictation: timings, model, screenshot flag, errors | **Truncated on every launch** |
+
+The `debug.log` truncation matches telecode's pattern — every launch starts with a fresh log so you don't have to scroll past last week's noise to debug today's issue.
+
+## Hotkey rebinding
+
+Tray > `Hotkey: Ctrl+Win` opens capture mode:
+1. Release every key on your keyboard so capture arms (avoids menu keystrokes leaking in)
+2. Press one key alone (`F9`) or two keys together (`Ctrl+Space`)
+3. Release
+
+The new combo persists across restarts.
+
+## Whisper models
 
 | Model | Speed | Accuracy | VRAM |
-|-------|-------|----------|------|
-| Tiny | Fastest | Basic | ~1GB |
-| Base | Fast | Good | ~1GB |
-| Small | Balanced | Great | ~2GB |
-| Medium | Slower | Better | ~5GB |
-| Large v3 | Slowest | Best | ~10GB |
+|---|---|---|---|
+| Tiny | Fastest | Basic | ~1 GB |
+| Base | Fast | Good | ~1 GB |
+| Small (default) | Balanced | Great | ~2 GB |
+| Medium | Slower | Better | ~5 GB |
+| Large v3 | Slowest | Best | ~10 GB |
 
-**Kokoro voices** (selectable from tray):
-
-| Voice | Gender | Accent |
-|-------|--------|--------|
-| Sky, Heart, Bella, Nova, Sarah, Nicole, Jessica | Female | American |
-| Adam, Michael, Eric, Liam | Male | American |
-| Emma, Alice | Female | British |
-| George, Daniel | Male | British |
-
-## Auto-Start (Task Scheduler)
-
-Setup creates three scheduled tasks automatically:
-
-| Task | Service |
-|------|---------|
-| `VoiceMode-Whisper-STT` | Whisper STT server (port 6600) |
-| `VoiceMode-Kokoro-TTS` | Kokoro TTS server (port 6500) |
-| `VoxType-Dictation` | Dictation overlay app |
-
-All tasks run hidden, auto-restart on crash, auto-restart on crash, runs hidden (Interactive logon).
-
-```powershell
-# Manual control
-schtasks /run /tn VoiceMode-Whisper-STT
-schtasks /run /tn VoiceMode-Kokoro-TTS
-schtasks /run /tn VoxType-Dictation
-
-# Stop
-schtasks /end /tn VoiceMode-Whisper-STT
-schtasks /end /tn VoiceMode-Kokoro-TTS
-schtasks /end /tn VoxType-Dictation
-```
-
-## Usage in Claude Code
-
-After setup and restarting Claude Code:
-
-```
-# Start a voice conversation (TTS + STT)
-/mcp__voicemode__converse
-```
-
-### How it works
-
-1. Claude speaks via **Kokoro TTS** (GPU-accelerated, ~1s generation)
-2. Your mic records with **VAD silence detection** (auto-stops when you go quiet)
-3. Audio transcribed via **local Whisper STT** (~0.5-1s)
-4. Transcribed text returned to Claude as your response
-
-### Modes
-
-| Mode | How | Use case |
-|------|-----|----------|
-| Full conversation | `converse("Hello!", wait_for_response=true)` | Two-way voice chat |
-| TTS only | `converse("Hello!", wait_for_response=false)` | Claude speaks, no mic |
-| STT only | `converse("", skip_tts=true, wait_for_response=true)` | Mic only, no speech |
-
-### Shared services
-
-VoxType and Claude Code MCP share the same Whisper and Kokoro servers:
-- Switching Whisper model in VoxType tray changes it for Claude Code too
-- Switching Kokoro voice in VoxType tray changes Claude Code's TTS voice
-- Both use `localhost:6600` (STT) and `localhost:6500` (TTS)
-
-## Architecture
-
-```
-Claude Code                          Any Windows App
-    |                                      ^
-    v                                      |
-VoiceMode MCP (patched)              VoxType (Electron)
-    |                                 |          |
-    +---> Kokoro TTS --> Speaker      |    LM Studio
-    |     :6500                       |    :1234
-    |                                 |
-    +---> Mic --> Whisper STT <-------+
-                  :6600
-```
-
-## Configuration
-
-| Variable | Default | Description |
-|----------|---------|-------------|
-| `VOICEMODE_STT_BASE_URLS` | `http://127.0.0.1:6600/v1` | Whisper STT endpoint |
-| `VOICEMODE_TTS_BASE_URLS` | `http://127.0.0.1:6500/v1` | Kokoro TTS endpoint |
-| `VOICEMODE_VOICES` | `af_sky,alloy` | Kokoro voice (set via VoxType tray) |
-
-## Troubleshooting
-
-### VoxType: First words get cut off
-This was fixed with mic pre-warming. If it still happens, check that the Electron app has microphone permissions in Windows Settings > Privacy > Microphone.
-
-### VoxType: LLM rewrites my words
-The enhancement prompt is designed to preserve your exact words. If it's still too aggressive, disable "LLM enhance" in the tray menu to get raw Whisper output.
-
-### Services not starting
-```powershell
-netstat -ano | findstr "6500 6600"
-```
-
-### STT returns empty
-Switch to a larger Whisper model via VoxType tray > Whisper model, or:
-```powershell
-.\setup.ps1 -WhisperModel "Systran/faster-whisper-medium"
-```
+Switching models in the tray restarts the Whisper child process — first dictation after switch downloads the model if it's new.
 
 ## Uninstall
 
@@ -219,15 +161,22 @@ Switch to a larger Whisper model via VoxType tray > Whisper model, or:
 .\uninstall.ps1
 ```
 
-Removes all scheduled tasks, VoxType data, and optionally the install directory.
+Stops VoxType, removes the scheduled task, kills any orphaned child processes, optionally removes:
+- `~/.voxtype/` (user settings + history + logs)
+- `~/.voicemode/` (legacy directory from old voice-mode MCP, if present)
+- `~/.voicemode-windows/` (install dir, ~3 GB with Kokoro)
+
+## Known limits
+
+- **Vision models add latency.** Screen-context cleanup adds 1–3 s on a 7 B vision model. Disable "Screen context" in tray for snappier text-only cleanup.
+- **First Whisper run is slow.** New model downloads on first request — minutes for Large v3.
+- **No Linux/macOS.** Windows-specific (uiohook keycodes, taskkill, electron transparent flags).
 
 ## Credits
 
-- [VoiceMode](https://github.com/mbailey/voicemode) by Mike Bailey
-- [faster-whisper-server](https://github.com/fedirz/faster-whisper-server) by fedirz
-- [Kokoro-FastAPI](https://github.com/remsky/Kokoro-FastAPI) by remsky
-- [Claude Code](https://claude.ai/claude-code) by Anthropic
-- Inspired by [Wispr Flow](https://wisprflow.ai/)
+- [faster-whisper-server](https://github.com/fedirz/faster-whisper-server) — fedirz
+- [Kokoro-FastAPI](https://github.com/remsky/Kokoro-FastAPI) — remsky
+- [Wispr Flow](https://wisprflow.ai) — inspiration
 
 ## License
 

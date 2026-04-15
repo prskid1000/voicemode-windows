@@ -1,164 +1,156 @@
-# VoiceMode Windows - Project Guide
+# VoxType - Project Guide
 
 ## Overview
 
-Windows setup automation for VoiceMode MCP (local voice for Claude Code) + **VoxType** dictation overlay app.
-Patches the Linux/macOS-only VoiceMode package to work on Windows with local Whisper STT and Kokoro TTS.
-VoxType is an Electron-based Wispr Flow alternative — press a hotkey to dictate into any Windows app.
+VoxType is a local Wispr Flow alternative for Windows. Press a hotkey, speak, release — text appears at your cursor. Built as a single Electron app that **owns the lifecycle of all bundled services** (Whisper STT, Kokoro TTS) — they spawn as child processes when VoxType starts and die when it quits. One scheduled task. No `.bat`/`.vbs` wrappers. No voice-mode MCP server.
 
 ## Project Structure
 
 ```
-voicemode-windows/
-├── setup.ps1                     # Main installer (entry point)
-├── configure-claude.ps1          # Adds MCP server to Claude Code via CLI
-├── create-scheduled-tasks.ps1    # Creates Task Scheduler entries for STT+TTS
-├── uninstall.ps1                 # Clean uninstall (including VoxType)
-├── patches/
-│   ├── apply-patches.ps1         # Wrapper that calls the Python patcher
-│   └── apply-patches.py          # All 5 Windows patches (reliable LF matching)
-├── voxtype/                      # VoxType dictation overlay (Electron app)
+voicemode-windows/                  # repo IS the install directory
+├── setup.ps1                       # Installer — installs venvs, builds VoxType, registers one scheduled task
+├── uninstall.ps1                   # Removes task + (optionally) install dir + user data
+├── voxtype/                        # Electron app
 │   ├── package.json
 │   ├── vite.config.ts
 │   ├── tsconfig.json / tsconfig.node.json
 │   ├── electron-builder.json
-│   ├── create-scheduled-task.ps1 # Auto-start VoxType at login
-│   ├── start-voxtype.vbs         # No-console launcher (VBS → electron.exe direct)
-│   ├── start-voxtype.bat         # Manual launcher (console visible)
 │   ├── src/
-│   │   ├── main/                 # Electron main process
-│   │   │   ├── index.ts          # App entry, window, IPC, pipeline
-│   │   │   ├── hotkey.ts         # uiohook-napi: custom two-key combos
-│   │   │   ├── stt.ts            # POST audio to Whisper (localhost:6600)
-│   │   │   ├── llm.ts            # POST transcript to LM Studio for enhancement
-│   │   │   ├── typer.ts          # Clipboard + Ctrl+V via PowerShell
-│   │   │   ├── tray.ts           # System tray icon + full settings menu
-│   │   │   ├── preload.ts        # contextBridge for renderer IPC
-│   │   │   ├── vad.ts            # Energy-based voice activity detection
-│   │   │   ├── history.ts        # Transcription history (~/.voxtype/history.json)
-│   │   │   ├── whisper-model.ts  # Whisper model switcher (rewrites bat, restarts task)
-│   │   │   └── kokoro-voice.ts   # Kokoro voice selector (writes ~/.voicemode/voicemode.env)
-│   │   ├── renderer/             # React UI
-│   │   │   ├── index.html
-│   │   │   ├── main.tsx
-│   │   │   ├── App.tsx           # Audio capture, mic pre-warming, silence detection
-│   │   │   ├── components/
-│   │   │   │   ├── Pill.tsx      # Liquid-mercury orb overlay (6 animated states)
-│   │   │   │   └── Settings.tsx  # Settings panel
-│   │   │   └── styles/
-│   │   │       └── globals.css   # Tailwind + custom animations
-│   │   └── shared/
-│   │       └── types.ts          # Shared types & IPC channel names
-│   └── resources/
-│       ├── icon.svg              # App icon (SVG source)
-│       ├── icon.png              # Tray icon (64x64 PNG)
-│       └── gen_icon.py           # Icon generator script
+│   │   ├── main/
+│   │   │   ├── index.ts            # App entry, IPC, pipeline, service lifecycle
+│   │   │   ├── services.ts         # Child process manager (Whisper + Kokoro)
+│   │   │   ├── debug-log.ts        # Truncates ~/.voxtype/{debug.log,sessions.jsonl} on startup, tees console
+│   │   │   ├── hotkey.ts           # uiohook-napi: custom hotkeys, auto-repeat suppression
+│   │   │   ├── stt.ts              # POST audio to Whisper child
+│   │   │   ├── llm.ts              # POST transcript (+ screenshot) to LM Studio with JSON schema
+│   │   │   ├── kokoro-voice.ts     # Kokoro voice catalog + preload helper
+│   │   │   ├── whisper-model.ts    # Whisper model catalog
+│   │   │   ├── screen-capture.ts   # desktopCapturer + cursor marker overlay
+│   │   │   ├── typer.ts            # Clipboard + Ctrl+V via PowerShell
+│   │   │   ├── tray.ts             # Grouped tray menu (Services / Recording / History / Pill)
+│   │   │   ├── preload.ts          # contextBridge for renderer
+│   │   │   ├── vad.ts              # Energy-based VAD
+│   │   │   └── history.ts          # ~/.voxtype/history.json (last 20 entries)
+│   │   ├── renderer/               # React UI (audio capture + pill overlay)
+│   │   └── shared/types.ts         # AppSettings + IPC channels
+│   ├── resources/
+│   │   ├── icon.png
+│   │   └── system-prompt.md        # LLM cleanup prompt — hot-reloaded, edit freely
+│   └── dist/                       # Built output (electron loads from here)
 ├── README.md
-├── CLAUDE.md                     # This file
+├── CLAUDE.md                       # This file
 ├── LICENSE
 └── .gitignore
 ```
 
-## Install Directory Layout (created by setup.ps1)
+## Install Directory Layout (after setup.ps1)
 
 ```
-~/.voicemode-windows/
-├── mcp-venv/                     # VoiceMode MCP server (patched)
-├── stt-venv/                     # faster-whisper-server
-├── tts-venv/                     # Kokoro-FastAPI + PyTorch CUDA
-├── Kokoro-FastAPI/               # Cloned repo + downloaded model
-├── voxtype/                      # VoxType app (copied from repo at setup)
-│   ├── dist/                     # Built Electron app
-│   ├── node_modules/             # Runtime dependencies
-│   ├── resources/                # Icons
-│   ├── start-voxtype.vbs         # VBS launcher (no console)
-│   ├── start-voxtype.bat         # Manual launcher
-│   └── create-scheduled-task.ps1 # Task creator
-├── start-whisper-stt.bat         # Whisper startup (port 6600)
-├── start-kokoro-tts.bat          # Kokoro startup (port 6500)
-└── voicemode.env                 # Env vars reference
+~/.voicemode-windows/                # repo + install (same dir)
+├── stt-venv/                        # faster-whisper-server (Python venv)
+├── tts-venv/                        # Kokoro PyTorch (Python venv) — optional
+├── Kokoro-FastAPI/                  # Cloned repo + 313 MB model — optional
+├── voxtype/                         # See above; built in place
+└── (no .bat, no .vbs, no patches/, no configure-claude.ps1)
 
 ~/.voxtype/
-└── history.json                  # Transcription history (last 20 entries)
-
-~/.voicemode/
-└── voicemode.env                 # VoiceMode config (Kokoro voice selection)
+├── settings.json                    # Persistent
+├── history.json                     # Persistent — last 20 entries, shown in tray
+├── debug.log                        # Truncated on every launch
+└── sessions.jsonl                   # Truncated on every launch
 ```
 
-## VoxType Features
+`~/.voicemode/` is a legacy directory from the old voice-mode MCP integration. VoxType no longer reads or writes it. Safe to delete via `uninstall.ps1`.
 
-### Core Pipeline
-- **Hotkey** → **Record** → **Transcribe** → **Enhance** → **Type at cursor**
-- Pre-warmed mic stream for instant recording (no 3s startup delay)
-- Clipboard save/restore via PowerShell (works in every Windows app)
+## Architecture: VoxType owns its services
 
-### Tray Menu Settings
-| Setting | Description |
-|---------|-------------|
-| Hold to talk / Toggle | Recording mode |
-| Hotkey | Custom two-key combo (click to capture) |
-| Whisper model | Tiny/Base/Small/Medium/Large v3 (restarts service) |
-| Kokoro voice | 15 featured voices (writes to voicemode.env) |
-| LLM enhance | Toggle post-processing via LM Studio |
-| LLM model → Auto-unload after | Unload all models (LLM + Whisper + Kokoro) after idle (Disabled/5/10/15/30/60 min) |
-| LLM model → Preload on startup | Warm-up Whisper + Kokoro + LLM at launch (parallel dummy requests) |
-| Append mode | Append text after cursor vs replace selection |
-| Auto-stop on silence | Stop recording after 2s silence |
-| Skip silence (VAD) | Skip sending empty audio to Whisper |
-| Save history | Store last 20 transcriptions |
-| History | View/copy past transcriptions |
-| Reset pill position | Snap pill back to bottom-center |
+```
+Scheduled Task: VoxType-Dictation
+  └─ launches: electron.exe dist/main/main/index.js
+       └─ on app.ready:
+            ├─ if settings.whisperEnabled → spawn Whisper child (faster-whisper-server.exe)
+            ├─ if settings.kokoroEnabled → spawn Kokoro child (uvicorn)
+            ├─ build tray (status badges refresh every 5 s)
+            └─ start hotkey listener
+       └─ on app.before-quit:
+            └─ taskkill /T (with timeout) → /F all child processes
+```
 
-### Pill UI States
-| State | Visual |
-|-------|--------|
-| Idle | Dark orb with aurora breathing glow |
-| Recording | Expands to pill — red dot + live waveform + crimson glow |
-| Processing | Orb with amber orbital dots spinner |
-| Enhancing | Orb with indigo sparkle twinkle |
-| Typing | Orb with green checkmark draw-in |
-| Error | Orb with red lightning bolt jolt |
+`services.ts` is the only module that calls `spawn` / `taskkill`. It tracks each managed child:
 
-### LLM Enhancement
-- Auto-detects loaded LM Studio model via `/v1/models`
-- XML-structured system prompt with 11 rules + 10 long examples
-- Handles: fillers, stutters, self-corrections, spoken punctuation, numbers, currency, lists, tech terms
-- Temperature 0 for deterministic output
+```ts
+interface Managed {
+  proc: ChildProcess | null;
+  config: WhisperConfig | KokoroConfig;
+  ready: boolean;          // healthcheck passed
+  stopping: boolean;       // suppresses auto-restart during intentional stop
+  restartCount: number;    // exponential backoff on crash
+  restartTimer: Timeout | null;
+}
+```
+
+Healthcheck polls `http://127.0.0.1:<port>/health` until 200 (or 60 s timeout). Auto-restart on unexpected exit uses exponential backoff (1 s, 2 s, 4 s, … capped at 30 s).
+
+Pattern adapted from telecode (`main.py:113-128`) — same SIGTERM-then-SIGKILL approach via `taskkill /T` and `taskkill /T /F`.
+
+## VoxType Pipeline
+
+1. **Hotkey down** (`hotkey.ts`) → `START_RECORDING` IPC to renderer
+2. **Renderer** captures from pre-warmed mic stream, monitors RMS for auto-stop
+3. **Hotkey up / silence** → audio Buffer sent back via `AUDIO_DATA` IPC
+4. **`handleAudioData` in `index.ts`** kicks off in parallel:
+   - Screen capture (`screen-capture.ts`) — only if `enhanceEnabled && screenContext`
+   - Whisper transcription (`stt.ts`)
+5. **VAD gate** drops empty/silent recordings before sending to Whisper
+6. **LLM enhance** (`llm.ts`) — JSON-schema response with `{screen_context, cursor_focus, edit_plan, output}`. Only `output` is shown.
+7. **Type at cursor** (`typer.ts`) — clipboard write + `Ctrl+V` via PowerShell
+8. **Session record** appended to `~/.voxtype/sessions.jsonl`
+
+## LLM Structured Output
+
+System prompt at `voxtype/resources/system-prompt.md` (read fresh on every call — no rebuild needed for prompt tweaks).
+
+Schema enforced by LM Studio's grammar-constrained decoding (`response_format: json_schema, strict: true`):
+
+```json
+{
+  "screen_context": "string, maxLength 200",
+  "cursor_focus":   "string, maxLength 150",
+  "edit_plan":      "string, maxLength 300",
+  "output":         "string, unbounded"
+}
+```
+
+Scratch fields are bounded so the model can't blather and truncate the actual transcript. Scratch values are logged to `debug.log` for debugging.
+
+Cursor marker (red ring + dot at the OS cursor position) is painted onto the captured bitmap before JPEG encoding — Electron's `desktopCapturer` doesn't include the OS cursor on Windows.
+
+## Tray Menu (grouped)
+
+| Top-level | Submenu |
+|---|---|
+| `◉ Hold to talk` / `◉ Toggle on/off` | (radio) |
+| `Hotkey: …` | Click to rebind (single key or two-key combo) |
+| `Services ▶` | Whisper, Kokoro, LM Studio (each with Enabled toggle, Model/Voice picker, Device GPU/CPU, Restart now) |
+| `Recording ▶` | Auto-stop on silence, VAD, Append mode |
+| `History ▶` | Save toggle + last 10 entries |
+| `Pill ▶` | Show/Hide, Reset position |
+| `Quit` | |
+
+Status badges (`● ready` / `… starting` / `○ off`) live-poll `services.ts` and refresh every 5 s.
 
 ## Key Design Decisions
 
-- **Python patcher, not PowerShell**: PowerShell here-strings use CRLF which silently fails on LF Python files.
-- **Separate venvs**: MCP, STT, TTS each get their own venv to avoid dependency conflicts.
-- **PyTorch installed separately**: Kokoro's `pyproject.toml` uses `[tool.uv.sources]` for CUDA index which pip doesn't understand.
-- **`claude mcp add` via CLI**: Never parse `.claude.json` directly.
-- **Three separate scheduled tasks**: VoiceMode-Whisper-STT, VoiceMode-Kokoro-TTS, VoxType-Dictation.
-- **Interactive logon for all tasks**: All services use Interactive logon (runs when user is logged on). This allows VoxType to kill and restart Whisper/Kokoro processes when switching models. S4U was removed because its processes cannot be terminated by the user.
-- **VBS launcher for VoxType**: `start-voxtype.vbs` launches `electron.exe` directly (GUI binary at `node_modules/electron/dist/electron.exe`), bypassing `electron.cmd` which spawns a console window. The VBS itself runs silently via `wscript.exe`.
-- **Mic pre-warming**: getUserMedia() called once at app start, stream reused for instant recording (eliminates 3s mic startup delay).
-- **Transparent Electron window**: `enable-transparent-visuals` + `disable-gpu-compositing` flags for Windows.
-- **Preload sandboxing**: IPC constants inlined in preload.ts (can't import from shared modules in sandbox).
-- **Whisper model switch**: Rewrites .bat file + kills `faster-whisper-server` process + restarts scheduled task.
-- **Kokoro voice switch**: Writes to `~/.voicemode/voicemode.env` (VOICEMODE_VOICES var). No restart needed — picked up on next TTS call.
-- **Kokoro preload**: `preloadKokoro()` sends a short TTS request ("ok") at startup to warm up the model, runs in parallel with Whisper and LLM preload.
-
-## Windows Patches (in apply-patches.py)
-
-1. **conch.py** — `fcntl` → `msvcrt` for file locking
-2. **migration_helpers.py** — `os.uname()` → `platform.system()`
-3. **model_install.py** — `os.uname()` → `platform.machine()`
-4. **simple_failover.py** — `response_format: "text"` → `"json"`, remove `language="auto"`
-5. **converse.py** — `scipy.signal.resample` → numpy decimation (fixes VAD freeze)
-
-## Known Limitations
-
-- **Conch lock**: The `~/.voicemode/conch` file can get stuck if MCP process is killed. Delete manually if voice freezes.
-- **faster-whisper-server**: Doesn't support `response_format=text` or `language=auto`. Patches handle this.
-- **Small LLM hallucination**: 0.8B models may occasionally rewrite instead of clean up. Temperature 0 + examples mitigate this.
-- **Whisper model download**: First use of a new model triggers a download (can take minutes for Large v3).
-
-## Workflow Rules
-
-- **Always rebuild VoxType dist after committing source changes.** The repo and install location are the same directory (`~/.voicemode-windows/`), and VoxType runs from `voxtype/dist/main/main/index.js`. Source edits in `voxtype/src/` have no effect at runtime until `npm run build:main` (and `npx vite build` for renderer changes) is executed. After every commit that touches `voxtype/src/`, run the build immediately so the next launch picks up the change.
+- **VoxType owns Whisper + Kokoro lifecycles** — not separate scheduled tasks. One task to install, one to uninstall, one to debug. Children die with parent (taskkill /T).
+- **No .bat/.vbs wrappers** — `electron.exe` is a GUI binary so the scheduled task launches it directly. No console window appears, no shell layer to debug.
+- **Whisper auto-spawns; Kokoro is opt-in.** VoxType itself doesn't consume TTS — Kokoro is provided for users who want a local TTS endpoint (e.g. for other apps). Default off saves ~3 GB of VRAM.
+- **JSON Schema for LLM output** — grammar-constrained decoding makes structured output impossible to break. Per-field `maxLength` keeps scratch fields tiny so they don't eat the `output` budget.
+- **System prompt as a separate file** — `resources/system-prompt.md` is read fresh on every enhance call. No rebuild needed to tweak prompt.
+- **Debug log truncates on launch** — matches telecode pattern; each VoxType run starts with a fresh log.
+- **History is separate from debug** — `~/.voxtype/history.json` stays persistent (user-visible in tray); `debug.log` and `sessions.jsonl` are scoped to the current run.
+- **Hotkey auto-repeat suppression** — Windows fires `keydown` continuously while a key is held; `hotkey.ts` ignores repeats so toggle mode doesn't flip-flop.
+- **Mic pre-warming** — `getUserMedia()` called once at app start so the first dictation is instant.
+- **Cursor marker in screenshots** — Electron's `desktopCapturer` skips the OS cursor on Windows; we paint a red ring + dot ourselves at the cursor position before encoding.
 
 ## Common Tasks
 
@@ -167,37 +159,49 @@ voicemode-windows/
 cd voxtype && npm run dev
 ```
 
-### Build VoxType
+### Build VoxType after editing src/
 ```powershell
 cd voxtype && npm run build:main && npx vite build
 ```
 
-### Test services
+### Tail logs while debugging
 ```powershell
-curl http://127.0.0.1:6600/health  # Whisper STT
-curl http://127.0.0.1:6500/health  # Kokoro TTS
+Get-Content -Path "$env:USERPROFILE\.voxtype\debug.log" -Wait -Tail 50
 ```
 
-### Re-apply patches after voice-mode pip update
+### Manually start / stop / restart
 ```powershell
-python patches\apply-patches.py "$env:USERPROFILE\.voicemode-windows\mcp-venv"
+schtasks /run /tn VoxType-Dictation
+schtasks /end /tn VoxType-Dictation
 ```
 
-### Clear stuck conch lock
-```bash
-rm ~/.voicemode/conch
+### Test bundled services directly (when VoxType is running)
+```powershell
+curl http://127.0.0.1:6600/health   # Whisper
+curl http://127.0.0.1:6500/health   # Kokoro (only if enabled in tray)
 ```
+
+## Workflow Rules
+
+- **Always rebuild VoxType `dist/` after committing source changes.** The repo and install location are the same directory, and the scheduled task launches `dist/main/main/index.js`. Source edits in `voxtype/src/` have no effect at runtime until `npm run build:main` (and `npx vite build` for renderer changes) is executed. After every commit that touches `voxtype/src/`, run the build immediately so the next launch picks up the change.
+- **System prompt edits don't need a rebuild** — `resources/system-prompt.md` is read at runtime.
+- **Don't delete `~/.voxtype/history.json`** when debugging — that's user-visible data. Use `debug.log` and `sessions.jsonl` for diagnostics.
 
 ## Dependencies
 
 | Component | Version | Source |
 |-----------|---------|--------|
-| voice-mode | 8.5.x | PyPI |
+| Electron | 35.x | npm |
+| React | 19.x | npm |
+| uiohook-napi | 1.5.x | npm |
+| Tailwind CSS | 4.x | npm |
 | faster-whisper-server | 0.0.2 | PyPI |
 | Kokoro-FastAPI | 0.3.x | GitHub (remsky/Kokoro-FastAPI) |
 | PyTorch | 2.8.x+cu129 | pytorch.org |
-| webrtcvad | 2.0.10 | PyPI |
-| Electron | 35.x | npm |
-| React | 19.x | npm |
-| Tailwind CSS | 4.x | npm |
-| uiohook-napi | 1.5.x | npm |
+
+## Known Limitations
+
+- **First model download is slow** — Whisper Large v3 can take minutes the first time it's selected.
+- **Vision models add latency** — screen-context cleanup adds 1–3 s on a 7 B vision LLM. Disable in tray > Services > LM Studio > Screen context for snappier text-only cleanup.
+- **Windows only** — uiohook keycodes, `taskkill`, transparent-window flags are all Windows-specific.
+- **Small LLM hallucination** — 0.8 B models occasionally rewrite instead of clean up. Temperature 0 + structured output mitigate but don't eliminate.

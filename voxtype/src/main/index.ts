@@ -2,15 +2,24 @@ import { app, BrowserWindow, ipcMain, screen } from 'electron';
 import path from 'path';
 import fs from 'fs';
 import os from 'os';
+import { initDebugLog, logSession } from './debug-log';
+
+// Must run before any other import that logs at module-init time.
+initDebugLog();
+
 import { startHotkeyListener, stopHotkeyListener, setHotkeyMode, setHotkeyCombo } from './hotkey';
 import { transcribe, preloadWhisper } from './stt';
-import { enhance, fetchModels, ensureLMStudio, preloadCurrentModel, resetAutoUnloadTimer, stopAutoUnloadTimer } from './llm';
+import { enhance, fetchModels, ensureLMStudio, preloadCurrentModel, resetAutoUnloadTimer, stopAutoUnloadTimer, getCurrentLLMModel } from './llm';
 import { preloadKokoro } from './kokoro-voice';
+import { captureActiveScreen } from './screen-capture';
 import { typeText } from './typer';
 import { createTray } from './tray';
 import { hasSpeech, estimateDuration } from './vad';
 import { addEntry } from './history';
-import { IPC, DEFAULT_SETTINGS, type AppSettings, type PillState } from '../shared/types';
+import {
+  startWhisper, startKokoro, stopAll as stopAllServices, restartService,
+} from './services';
+import { IPC, DEFAULT_SETTINGS, whisperUrlFor, type AppSettings, type PillState } from '../shared/types';
 
 // Required for transparent windows on some Windows setups
 app.commandLine.appendSwitch('enable-transparent-visuals');
@@ -101,6 +110,49 @@ function sendState(state: PillState, detail?: string) {
   mainWindow?.webContents.send(IPC.STATE_CHANGE, state, detail);
 }
 
+// Reconcile child services with new settings. Called whenever settings change
+// so toggling Whisper/Kokoro on/off, switching model/voice/device, or
+// changing port immediately starts, stops, or restarts the right child.
+async function applyServiceChanges(prev: AppSettings, next: AppSettings): Promise<void> {
+  // Whisper
+  if (prev.whisperEnabled !== next.whisperEnabled) {
+    if (next.whisperEnabled) {
+      await startWhisper({
+        model: next.whisperModel,
+        port: next.whisperPort,
+        device: next.whisperDevice,
+      });
+    } else {
+      await import('./services').then((s) => s.stopService('whisper'));
+    }
+  } else if (
+    next.whisperEnabled &&
+    (prev.whisperModel !== next.whisperModel ||
+      prev.whisperPort !== next.whisperPort ||
+      prev.whisperDevice !== next.whisperDevice)
+  ) {
+    await restartService('whisper', {
+      model: next.whisperModel,
+      port: next.whisperPort,
+      device: next.whisperDevice,
+    });
+  }
+
+  // Kokoro
+  if (prev.kokoroEnabled !== next.kokoroEnabled) {
+    if (next.kokoroEnabled) {
+      await startKokoro({ port: next.kokoroPort, device: next.kokoroDevice });
+    } else {
+      await import('./services').then((s) => s.stopService('kokoro'));
+    }
+  } else if (
+    next.kokoroEnabled &&
+    (prev.kokoroPort !== next.kokoroPort || prev.kokoroDevice !== next.kokoroDevice)
+  ) {
+    await restartService('kokoro', { port: next.kokoroPort, device: next.kokoroDevice });
+  }
+}
+
 function sendError(msg: string) {
   mainWindow?.webContents.send(IPC.ERROR, msg);
   sendState('error', msg);
@@ -109,23 +161,50 @@ function sendError(msg: string) {
 async function handleAudioData(_event: Electron.IpcMainEvent, audioBuffer: Buffer) {
   cancelled = false;
 
+  const t0 = Date.now();
+  const duration = estimateDuration(audioBuffer);
+  const audioKB = Math.round(audioBuffer.length / 1024);
+
+  // Session record — filled in as the pipeline runs, flushed at the end.
+  const rec: Parameters<typeof logSession>[0] = {
+    ts: new Date().toISOString(),
+    durationSec: +duration.toFixed(2),
+    audioKB,
+  };
+
   try {
     // VAD: skip if audio is silence or too short
-    const duration = estimateDuration(audioBuffer);
     if (settings.vadEnabled && (duration < 0.3 || !hasSpeech(audioBuffer))) {
       console.log(`[VoxType] Skipped: ${duration.toFixed(1)}s, no speech detected`);
+      rec.skipped = duration < 0.3 ? 'too-short' : 'no-speech';
+      rec.totalMs = Date.now() - t0;
+      logSession(rec);
       sendState('idle');
       return;
     }
 
-    console.log(`[VoxType] Processing ${duration.toFixed(1)}s audio (${(audioBuffer.length / 1024).toFixed(0)}KB)`);
+    console.log(`[VoxType] Processing ${duration.toFixed(1)}s audio (${audioKB}KB)`);
+
+    // Kick off screen capture in parallel with transcription so the screenshot
+    // reflects what the user was looking at when they finished speaking,
+    // without adding latency to the enhance step.
+    const screenshotPromise: Promise<string | null> =
+      settings.enhanceEnabled && settings.screenContext
+        ? captureActiveScreen()
+        : Promise.resolve(null);
 
     // Step 1: Transcribe
     sendState('processing');
-    const transcript = await transcribe(audioBuffer, settings.whisperUrl);
+    const sttStart = Date.now();
+    const transcript = await transcribe(audioBuffer, whisperUrlFor(settings));
+    rec.sttMs = Date.now() - sttStart;
+    rec.raw = transcript;
 
-    if (cancelled) return;
+    if (cancelled) { rec.skipped = 'cancelled'; rec.totalMs = Date.now() - t0; logSession(rec); return; }
     if (!transcript.trim()) {
+      rec.skipped = 'empty-transcript';
+      rec.totalMs = Date.now() - t0;
+      logSession(rec);
       sendState('idle');
       return;
     }
@@ -135,17 +214,27 @@ async function handleAudioData(_event: Electron.IpcMainEvent, audioBuffer: Buffe
     if (settings.enhanceEnabled) {
       sendState('enhancing');
       try {
-        finalText = await enhance(transcript, settings.lmStudioUrl);
+        const screenshot = await screenshotPromise;
+        rec.hadScreenshot = !!screenshot;
+        if (screenshot) rec.screenshotKB = Math.round((screenshot.length * 3) / 4 / 1024);
+        rec.model = getCurrentLLMModel() ?? undefined;
+
+        const llmStart = Date.now();
+        finalText = await enhance(transcript, settings.lmStudioUrl, screenshot);
+        rec.llmMs = Date.now() - llmStart;
         if (!finalText.trim()) finalText = transcript;
       } catch (err) {
         console.error('LLM enhancement failed, using raw transcript:', err);
+        rec.error = err instanceof Error ? err.message : String(err);
         finalText = transcript;
       }
     }
 
-    if (cancelled) return;
+    rec.enhanced = finalText;
 
-    // Save to history
+    if (cancelled) { rec.skipped = 'cancelled'; rec.totalMs = Date.now() - t0; logSession(rec); return; }
+
+    // Save to user-visible history (separate from sessions.jsonl debug log)
     if (settings.saveHistory) {
       addEntry(transcript, finalText);
     }
@@ -155,14 +244,19 @@ async function handleAudioData(_event: Electron.IpcMainEvent, audioBuffer: Buffe
     await typeText(finalText, settings.appendMode);
 
     sendState('idle');
+    rec.totalMs = Date.now() - t0;
+    logSession(rec);
 
     // Reset auto-unload timer after each successful use
     if (settings.autoUnloadMinutes > 0) {
-      resetAutoUnloadTimer(settings.autoUnloadMinutes, settings.lmStudioUrl, settings.whisperUrl);
+      resetAutoUnloadTimer(settings.autoUnloadMinutes, settings.lmStudioUrl);
     }
   } catch (err) {
     const msg = err instanceof Error ? err.message : String(err);
     console.error('Pipeline error:', msg);
+    rec.error = msg;
+    rec.totalMs = Date.now() - t0;
+    logSession(rec);
     sendError(msg);
     setTimeout(() => sendState('idle'), 3000);
   }
@@ -177,35 +271,64 @@ app.whenReady().then(() => {
   ipcMain.on(IPC.AUDIO_DATA, handleAudioData);
   ipcMain.on(IPC.CANCEL, () => { cancelled = true; });
   ipcMain.handle(IPC.GET_SETTINGS, () => ({ ...settings }));
-  ipcMain.handle(IPC.SET_SETTINGS, (_e, partial: Partial<AppSettings>) => {
+  ipcMain.handle(IPC.SET_SETTINGS, async (_e, partial: Partial<AppSettings>) => {
+    const before = { ...settings };
     Object.assign(settings, partial);
     saveSettings(settings);
     if (partial.hotkeyMode) setHotkeyMode(partial.hotkeyMode);
     if (partial.hotkey) setHotkeyCombo(partial.hotkey as AppSettings['hotkey']);
+    await applyServiceChanges(before, settings);
     return { ...settings };
   });
 
-  // Preload: warm up Whisper + Kokoro + LLM in parallel, then build tray
-  const whisperStartup = settings.preloadModel
-    ? preloadWhisper(settings.whisperUrl).catch(() => {})
+  // Build tray immediately so the user sees the app is alive — service
+  // startup happens in the background and the tray reflects status changes.
+  if (mainWindow) {
+    createTray(mainWindow, () => settings, (partial) => {
+      Object.assign(settings, partial);
+      saveSettings(settings);
+    });
+  }
+
+  // Spawn bundled services (Whisper, Kokoro) as child processes if enabled.
+  // Health-check + preload run in parallel and are non-blocking.
+  const whisperStartup = settings.whisperEnabled
+    ? startWhisper({
+        model: settings.whisperModel,
+        port: settings.whisperPort,
+        device: settings.whisperDevice,
+      })
+        .then(() =>
+          settings.preloadModel
+            ? preloadWhisper(whisperUrlFor(settings)).catch(() => {})
+            : undefined,
+        )
+        .catch((e) => console.error('[VoxType] Whisper startup failed:', e))
     : Promise.resolve();
-  const kokoroStartup = settings.preloadModel
-    ? preloadKokoro().catch(() => {})
+
+  const kokoroStartup = settings.kokoroEnabled
+    ? startKokoro({ port: settings.kokoroPort, device: settings.kokoroDevice })
+        .then(() =>
+          settings.preloadModel
+            ? preloadKokoro(settings.kokoroPort, settings.kokoroVoice).catch(() => {})
+            : undefined,
+        )
+        .catch((e) => console.error('[VoxType] Kokoro startup failed:', e))
     : Promise.resolve();
+
+  // LM Studio is external — VoxType doesn't manage it, just probes + preloads.
   const llmStartup = settings.preloadModel
     ? ensureLMStudio(settings.lmStudioUrl)
         .then(() => fetchModels(settings.lmStudioUrl, settings.llmModel))
         .then(() => preloadCurrentModel(settings.lmStudioUrl))
+        .catch(() => {})
     : Promise.resolve();
-  Promise.all([whisperStartup, kokoroStartup, llmStartup])
-    .catch(() => {})
-    .finally(() => {
-      if (mainWindow) createTray(mainWindow, () => settings, (partial) => { Object.assign(settings, partial); saveSettings(settings); });
-      // Start auto-unload timer if configured
-      if (settings.autoUnloadMinutes > 0) {
-        resetAutoUnloadTimer(settings.autoUnloadMinutes, settings.lmStudioUrl, settings.whisperUrl);
-      }
-    });
+
+  Promise.all([whisperStartup, kokoroStartup, llmStartup]).finally(() => {
+    if (settings.autoUnloadMinutes > 0) {
+      resetAutoUnloadTimer(settings.autoUnloadMinutes, settings.lmStudioUrl);
+    }
+  });
 
   // Hotkey listener
   setHotkeyMode(settings.hotkeyMode);
@@ -234,8 +357,22 @@ app.whenReady().then(() => {
   });
 });
 
-app.on('will-quit', () => {
+// Children must die with VoxType. before-quit fires once, early enough that
+// async work can complete before the process exits.
+let shuttingDown = false;
+app.on('before-quit', async (e) => {
+  if (shuttingDown) return;
+  shuttingDown = true;
+  e.preventDefault();
+  console.log('[VoxType] Shutting down — stopping bundled services...');
   stopHotkeyListener();
+  stopAutoUnloadTimer();
+  try {
+    await stopAllServices();
+  } catch (err) {
+    console.error('[VoxType] Service shutdown error (ignored):', err);
+  }
+  app.exit(0);
 });
 
 app.on('window-all-closed', () => {

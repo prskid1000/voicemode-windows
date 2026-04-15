@@ -103,6 +103,11 @@ export function startHotkeyListener(cbs: HotkeyCallbacks) {
 
   uIOhook.on('keydown', (e) => {
     const key = normalize(e.keycode);
+    // Ignore OS keydown auto-repeats — Windows fires keydown continuously
+    // while a key is held. In toggle mode this flips the state every repeat,
+    // making a single press behave like press→release (i.e. recording jumps
+    // straight to processing).
+    if (heldKeys.has(key)) return;
     heldKeys.add(key);
 
     // Capture mode
