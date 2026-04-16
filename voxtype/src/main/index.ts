@@ -53,6 +53,7 @@ function saveSettings(s: AppSettings) {
 let mainWindow: BrowserWindow | null = null;
 let settings: AppSettings = loadSettings();
 let cancelled = false;
+let pipelineRunning = false;
 
 function createWindow() {
   const { width: screenWidth, height: screenHeight } = screen.getPrimaryDisplay().workAreaSize;
@@ -159,6 +160,11 @@ function sendError(msg: string) {
 }
 
 async function handleAudioData(_event: Electron.IpcMainEvent, audioBuffer: Buffer) {
+  if (pipelineRunning) {
+    console.log('[VoxType] Pipeline already running — ignoring new audio');
+    return;
+  }
+  pipelineRunning = true;
   cancelled = false;
 
   const t0 = Date.now();
@@ -259,6 +265,8 @@ async function handleAudioData(_event: Electron.IpcMainEvent, audioBuffer: Buffe
     logSession(rec);
     sendError(msg);
     setTimeout(() => sendState('idle'), 3000);
+  } finally {
+    pipelineRunning = false;
   }
 }
 

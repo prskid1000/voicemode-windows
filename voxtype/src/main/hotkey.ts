@@ -11,12 +11,18 @@ let combo: HotkeyCombo = { key1: 29, key2: 3675, label: 'Ctrl + Win' };
 let callbacks: HotkeyCallbacks | null = null;
 let isActive = false;
 
-// Track all currently held keys
+// Track all currently held keys + when they were first pressed.
+// The timestamp lets us expire stale entries caused by missed keyup events
+// (common with Win/Meta — Windows intercepts them for the Start menu).
 const heldKeys = new Set<number>();
+const keyTimestamps = new Map<number, number>();
+
+// Keys "held" longer than this are almost certainly stale (missed keyup).
+const STALE_KEY_MS = 5000;
 
 // Capture mode: next two keys become the new hotkey
 let captureResolve: ((combo: HotkeyCombo) => void) | null = null;
-let captureReady = false; // becomes true once all pre-capture keys are released
+let captureReady = false;
 const captureKeys: number[] = [];
 
 export function setHotkeyMode(m: HotkeyMode) {
@@ -27,16 +33,9 @@ export function setHotkeyCombo(c: HotkeyCombo) {
   combo = c;
 }
 
-/**
- * Enter capture mode: returns a promise that resolves with the next
- * two-key combo the user presses. During capture, normal hotkey
- * activation is disabled.
- */
 export function captureHotkey(): Promise<HotkeyCombo> {
   return new Promise((resolve) => {
     captureKeys.length = 0;
-    // If the user triggered capture via keyboard (menu accelerator, Enter),
-    // some keys may still be held. Defer recording until everything is up.
     captureReady = heldKeys.size === 0;
     captureResolve = resolve;
   });
@@ -89,7 +88,6 @@ function keyName(code: number): string {
   return KEY_NAMES[code] || `Key${code}`;
 }
 
-// Normalize: treat left/right variants of modifiers as the same
 function normalize(code: number): number {
   if (code === UiohookKey.CtrlRight) return UiohookKey.Ctrl;
   if (code === UiohookKey.ShiftRight) return UiohookKey.Shift;
@@ -98,21 +96,40 @@ function normalize(code: number): number {
   return code;
 }
 
+let staleKeyTimer: ReturnType<typeof setInterval> | null = null;
+
 export function startHotkeyListener(cbs: HotkeyCallbacks) {
   callbacks = cbs;
 
+  // Periodically clear stale keys from heldKeys. If a keyup event was
+  // lost (Windows Start menu interception, focus steal, etc.), the key
+  // will look permanently held and break all future combo detection.
+  // Auto-repeat keydowns refresh the timestamp, so genuinely-held keys
+  // won't expire.
+  staleKeyTimer = setInterval(() => {
+    const now = Date.now();
+    for (const [k, ts] of keyTimestamps) {
+      if (now - ts > STALE_KEY_MS) {
+        heldKeys.delete(k);
+        keyTimestamps.delete(k);
+        console.log(`[Hotkey] Cleared stale key: ${keyName(k)} (held for ${((now - ts) / 1000).toFixed(1)}s — likely missed keyup)`);
+      }
+    }
+  }, 2000);
+
   uIOhook.on('keydown', (e) => {
     const key = normalize(e.keycode);
+
+    // Always refresh the timestamp so genuinely-held keys don't expire.
+    keyTimestamps.set(key, Date.now());
+
     // Ignore OS keydown auto-repeats — Windows fires keydown continuously
-    // while a key is held. In toggle mode this flips the state every repeat,
-    // making a single press behave like press→release (i.e. recording jumps
-    // straight to processing).
+    // while a key is held.
     if (heldKeys.has(key)) return;
     heldKeys.add(key);
 
     // Capture mode
     if (captureResolve) {
-      // Ignore keydowns until all pre-capture keys have been released
       if (!captureReady) return;
       if (!captureKeys.includes(key)) {
         captureKeys.push(key);
@@ -130,19 +147,25 @@ export function startHotkeyListener(cbs: HotkeyCallbacks) {
     }
 
     // Normal mode: check if all combo keys are held
-    const key2Held = combo.key2 === undefined || heldKeys.has(normalize(combo.key2));
-    if (heldKeys.has(normalize(combo.key1)) && key2Held) {
+    const key1Match = heldKeys.has(normalize(combo.key1));
+    const key2Match = combo.key2 === undefined || heldKeys.has(normalize(combo.key2));
+
+    if (key1Match && key2Match) {
       if (mode === 'hold') {
         if (!isActive) {
           isActive = true;
+          console.log(`[Hotkey] ACTIVATE (hold) — key=${keyName(key)} held=[${[...heldKeys].map(keyName).join(',')}]`);
           callbacks?.onActivate();
         }
       } else {
+        // Toggle mode
         if (!isActive) {
           isActive = true;
+          console.log(`[Hotkey] ACTIVATE (toggle) — key=${keyName(key)}`);
           callbacks?.onActivate();
         } else {
           isActive = false;
+          console.log(`[Hotkey] DEACTIVATE (toggle) — key=${keyName(key)}`);
           callbacks?.onDeactivate();
         }
       }
@@ -152,6 +175,7 @@ export function startHotkeyListener(cbs: HotkeyCallbacks) {
   uIOhook.on('keyup', (e) => {
     const key = normalize(e.keycode);
     heldKeys.delete(key);
+    keyTimestamps.delete(key);
 
     // Capture mode: once all pre-capture keys have been released, arm capture.
     if (captureResolve && !captureReady && heldKeys.size === 0) {
@@ -176,6 +200,7 @@ export function startHotkeyListener(cbs: HotkeyCallbacks) {
       const k2 = combo.key2 === undefined ? -1 : normalize(combo.key2);
       if (key === normalize(combo.key1) || key === k2) {
         isActive = false;
+        console.log(`[Hotkey] DEACTIVATE (hold release) — key=${keyName(key)}`);
         callbacks?.onDeactivate();
       }
     }
@@ -186,7 +211,9 @@ export function startHotkeyListener(cbs: HotkeyCallbacks) {
 
 export function stopHotkeyListener() {
   uIOhook.stop();
+  if (staleKeyTimer) { clearInterval(staleKeyTimer); staleKeyTimer = null; }
   callbacks = null;
   isActive = false;
   heldKeys.clear();
+  keyTimestamps.clear();
 }
