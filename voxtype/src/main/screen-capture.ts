@@ -2,7 +2,7 @@ import { desktopCapturer, nativeImage, screen } from 'electron';
 
 // Max dimension we send to the LLM — vision models downsample to ~1024px tiles
 // anyway, and smaller JPEGs keep first-token latency low.
-const MAX_DIM = 1280;
+const MAX_DIM = 768;
 const JPEG_QUALITY = 70;
 
 // Cursor marker geometry (in thumbnail pixels). A red ring with a dot at the

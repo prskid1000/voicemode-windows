@@ -36,7 +36,6 @@ export default function App() {
   const [demoMode, setDemoMode] = useState(false);
 
   const mediaRecorderRef = useRef<MediaRecorder | null>(null);
-  const chunksRef = useRef<Blob[]>([]);
   const analyserRef = useRef<AnalyserNode | null>(null);
   const animFrameRef = useRef<number>(0);
   const silenceStartRef = useRef<number>(0);
@@ -106,6 +105,12 @@ export default function App() {
 
   const startRecording = useCallback(async () => {
     try {
+      // Stop any active recorder first — prevents orphaned recorders if
+      // START_RECORDING arrives before a previous STOP_RECORDING completes.
+      if (mediaRecorderRef.current?.state === 'recording') {
+        mediaRecorderRef.current.stop();
+      }
+
       // Use pre-warmed stream or fallback to fresh request
       let stream = warmStreamRef.current;
       if (!stream || stream.getTracks().every((t) => t.readyState === 'ended')) {
@@ -163,13 +168,15 @@ export default function App() {
       updateWaveform();
 
       const recorder = new MediaRecorder(stream, { mimeType: 'audio/webm;codecs=opus' });
-      chunksRef.current = [];
+      const chunks: Blob[] = [];
       recorder.ondataavailable = (e) => {
-        if (e.data.size > 0) chunksRef.current.push(e.data);
+        if (e.data.size > 0) chunks.push(e.data);
       };
       recorder.onstop = async () => {
         source.disconnect();
-        const blob = new Blob(chunksRef.current, { type: 'audio/webm' });
+        // Use the local `chunks` array (not chunksRef) so a concurrent
+        // startRecording can't clear our data before we send it.
+        const blob = new Blob(chunks, { type: 'audio/webm' });
         const buffer = await blob.arrayBuffer();
         window.voxtype?.sendAudioData(buffer);
       };

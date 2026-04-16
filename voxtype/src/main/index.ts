@@ -52,8 +52,11 @@ function saveSettings(s: AppSettings) {
 
 let mainWindow: BrowserWindow | null = null;
 let settings: AppSettings = loadSettings();
-let cancelled = false;
-let pipelineRunning = false;
+
+// Simple serial lock. While busy, hotkey presses are ignored and no new
+// pipeline can start. Set true when audio arrives, false when pipeline
+// finishes (success or error). No overlap, no cancellation, no races.
+let busy = false;
 
 function createWindow() {
   const { width: screenWidth, height: screenHeight } = screen.getPrimaryDisplay().workAreaSize;
@@ -71,7 +74,7 @@ function createWindow() {
     transparent: true,
     alwaysOnTop: true,
     skipTaskbar: true,
-    show: false,
+    show: true,
     resizable: false,
     focusable: false,
     hasShadow: false,
@@ -160,18 +163,16 @@ function sendError(msg: string) {
 }
 
 async function handleAudioData(_event: Electron.IpcMainEvent, audioBuffer: Buffer) {
-  if (pipelineRunning) {
-    console.log('[VoxType] Pipeline already running — ignoring new audio');
+  if (busy) {
+    console.log('[VoxType] Busy — dropping audio');
     return;
   }
-  pipelineRunning = true;
-  cancelled = false;
+  busy = true;
 
   const t0 = Date.now();
   const duration = estimateDuration(audioBuffer);
   const audioKB = Math.round(audioBuffer.length / 1024);
 
-  // Session record — filled in as the pipeline runs, flushed at the end.
   const rec: Parameters<typeof logSession>[0] = {
     ts: new Date().toISOString(),
     durationSec: +duration.toFixed(2),
@@ -179,43 +180,38 @@ async function handleAudioData(_event: Electron.IpcMainEvent, audioBuffer: Buffe
   };
 
   try {
-    // VAD: skip if audio is silence or too short
+    // VAD gate
     if (settings.vadEnabled && (duration < 0.3 || !hasSpeech(audioBuffer))) {
-      console.log(`[VoxType] Skipped: ${duration.toFixed(1)}s, no speech detected`);
+      console.log(`[VoxType] Skipped: ${duration.toFixed(1)}s, no speech`);
       rec.skipped = duration < 0.3 ? 'too-short' : 'no-speech';
       rec.totalMs = Date.now() - t0;
       logSession(rec);
-      sendState('idle');
       return;
     }
 
     console.log(`[VoxType] Processing ${duration.toFixed(1)}s audio (${audioKB}KB)`);
 
-    // Kick off screen capture in parallel with transcription so the screenshot
-    // reflects what the user was looking at when they finished speaking,
-    // without adding latency to the enhance step.
+    // Screenshot in parallel with STT (both are I/O — no conflict)
     const screenshotPromise: Promise<string | null> =
       settings.enhanceEnabled && settings.screenContext
         ? captureActiveScreen()
         : Promise.resolve(null);
 
-    // Step 1: Transcribe
+    // 1. Transcribe
     sendState('processing');
     const sttStart = Date.now();
     const transcript = await transcribe(audioBuffer, whisperUrlFor(settings));
     rec.sttMs = Date.now() - sttStart;
     rec.raw = transcript;
 
-    if (cancelled) { rec.skipped = 'cancelled'; rec.totalMs = Date.now() - t0; logSession(rec); return; }
     if (!transcript.trim()) {
       rec.skipped = 'empty-transcript';
       rec.totalMs = Date.now() - t0;
       logSession(rec);
-      sendState('idle');
       return;
     }
 
-    // Step 2: Enhance (optional)
+    // 2. Enhance (optional)
     let finalText = transcript;
     if (settings.enhanceEnabled) {
       sendState('enhancing');
@@ -230,30 +226,23 @@ async function handleAudioData(_event: Electron.IpcMainEvent, audioBuffer: Buffe
         rec.llmMs = Date.now() - llmStart;
         if (!finalText.trim()) finalText = transcript;
       } catch (err) {
-        console.error('LLM enhancement failed, using raw transcript:', err);
+        console.error('LLM enhance failed, using raw:', err);
         rec.error = err instanceof Error ? err.message : String(err);
         finalText = transcript;
       }
     }
-
     rec.enhanced = finalText;
 
-    if (cancelled) { rec.skipped = 'cancelled'; rec.totalMs = Date.now() - t0; logSession(rec); return; }
+    // 3. Save history
+    if (settings.saveHistory) addEntry(transcript, finalText);
 
-    // Save to user-visible history (separate from sessions.jsonl debug log)
-    if (settings.saveHistory) {
-      addEntry(transcript, finalText);
-    }
-
-    // Step 3: Type
+    // 4. Type at cursor
     sendState('typing');
     await typeText(finalText, settings.appendMode);
 
-    sendState('idle');
     rec.totalMs = Date.now() - t0;
     logSession(rec);
 
-    // Reset auto-unload timer after each successful use
     if (settings.autoUnloadMinutes > 0) {
       resetAutoUnloadTimer(settings.autoUnloadMinutes, settings.lmStudioUrl);
     }
@@ -264,9 +253,9 @@ async function handleAudioData(_event: Electron.IpcMainEvent, audioBuffer: Buffe
     rec.totalMs = Date.now() - t0;
     logSession(rec);
     sendError(msg);
-    setTimeout(() => sendState('idle'), 3000);
   } finally {
-    pipelineRunning = false;
+    busy = false;
+    sendState('idle');
   }
 }
 
@@ -277,7 +266,7 @@ app.whenReady().then(() => {
 
   // IPC handlers
   ipcMain.on(IPC.AUDIO_DATA, handleAudioData);
-  ipcMain.on(IPC.CANCEL, () => { cancelled = true; });
+  ipcMain.on(IPC.CANCEL, () => { /* no-op in serial mode — pipeline runs to completion */ });
   ipcMain.handle(IPC.GET_SETTINGS, () => ({ ...settings }));
   ipcMain.handle(IPC.SET_SETTINGS, async (_e, partial: Partial<AppSettings>) => {
     const before = { ...settings };
@@ -343,7 +332,10 @@ app.whenReady().then(() => {
   setHotkeyCombo(settings.hotkey);
   startHotkeyListener({
     onActivate: () => {
-      cancelled = false;
+      if (busy) {
+        console.log('[Hotkey] Ignoring activate — busy');
+        return;
+      }
 
       // Multi-monitor: move pill to the display with the cursor
       if (settings.pillX < 0) {
@@ -360,6 +352,10 @@ app.whenReady().then(() => {
       sendState('recording');
     },
     onDeactivate: () => {
+      if (busy) {
+        console.log('[Hotkey] Ignoring deactivate — busy');
+        return;
+      }
       mainWindow?.webContents.send(IPC.STOP_RECORDING);
     },
   });
