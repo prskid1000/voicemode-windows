@@ -8,8 +8,12 @@ import { FEATURED_VOICES } from './kokoro-voice';
 import {
   getAvailableModels, getCurrentLLMModel, setLLMModel, fetchModels,
   resetAutoUnloadTimer, stopAutoUnloadTimer,
+  unloadCurrentModel, preloadCurrentModel,
 } from './llm';
-import { restartService, isRunning, getStatus } from './services';
+import {
+  restartService, isRunning, getStatus,
+  startWhisper, startKokoro, stopService,
+} from './services';
 
 let tray: Tray | null = null;
 
@@ -132,7 +136,6 @@ export function createTray(
   function llmMenu(s: AppSettings): Electron.MenuItemConstructorOptions {
     const models = getAvailableModels();
     const current = getCurrentLLMModel();
-    const unloadOptions = [0, 5, 10, 15, 30, 60];
     const modelItems: Electron.MenuItemConstructorOptions[] = models.length === 0
       ? [{ label: 'No models found', enabled: false }]
       : models.map((m) => ({
@@ -160,32 +163,71 @@ export function createTray(
       ...modelItems,
       { type: 'separator' },
       {
-        label: 'Auto-unload after',
-        submenu: unloadOptions.map((mins) => ({
-          label: mins === 0 ? 'Off' : `${mins} min`,
-          type: 'radio' as const,
-          checked: s.autoUnloadMinutes === mins,
-          click: () => {
-            updateSettings({ autoUnloadMinutes: mins });
-            if (mins > 0) resetAutoUnloadTimer(mins, s.lmStudioUrl);
-            else stopAutoUnloadTimer();
-            rebuildMenu();
-          },
-        })),
-      },
-      {
-        label: 'Preload on startup',
-        type: 'checkbox',
-        checked: s.preloadModel,
-        click: (item: any) => { updateSettings({ preloadModel: item.checked }); rebuildMenu(); },
-      },
-      { type: 'separator' },
-      {
         label: 'Refresh models',
         click: async () => { await fetchModels(s.lmStudioUrl); rebuildMenu(); },
       },
     ];
     return { label: 'LM Studio (LLM)', submenu: items };
+  }
+
+  async function loadAll(s: AppSettings): Promise<void> {
+    const tasks: Promise<unknown>[] = [];
+    if (s.whisperEnabled && !isRunning('whisper')) {
+      tasks.push(startWhisper({ model: s.whisperModel, port: s.whisperPort, device: s.whisperDevice }));
+    }
+    if (s.kokoroEnabled && !isRunning('kokoro')) {
+      tasks.push(startKokoro({ port: s.kokoroPort, device: s.kokoroDevice }));
+    }
+    tasks.push(preloadCurrentModel(s.lmStudioUrl));
+    await Promise.allSettled(tasks);
+    if (s.autoUnloadMinutes > 0) resetAutoUnloadTimer(s.autoUnloadMinutes, s.lmStudioUrl);
+  }
+
+  async function unloadAll(s: AppSettings): Promise<void> {
+    stopAutoUnloadTimer();
+    const tasks: Promise<unknown>[] = [];
+    if (isRunning('whisper')) tasks.push(stopService('whisper'));
+    if (isRunning('kokoro')) tasks.push(stopService('kokoro'));
+    tasks.push(unloadCurrentModel(s.lmStudioUrl));
+    await Promise.allSettled(tasks);
+  }
+
+  function powerMenu(s: AppSettings): Electron.MenuItemConstructorOptions {
+    const unloadOptions = [0, 5, 10, 15, 30, 60];
+    return {
+      label: 'Power',
+      submenu: [
+        {
+          label: 'Load all',
+          click: async () => { await loadAll(s); rebuildMenu(); },
+        },
+        {
+          label: 'Unload all',
+          click: async () => { await unloadAll(s); rebuildMenu(); },
+        },
+        { type: 'separator' },
+        {
+          label: 'Preload on startup',
+          type: 'checkbox',
+          checked: s.preloadModel,
+          click: (item: any) => { updateSettings({ preloadModel: item.checked }); rebuildMenu(); },
+        },
+        {
+          label: 'Auto-unload after',
+          submenu: unloadOptions.map((mins) => ({
+            label: mins === 0 ? 'Off' : `${mins} min`,
+            type: 'radio' as const,
+            checked: s.autoUnloadMinutes === mins,
+            click: () => {
+              updateSettings({ autoUnloadMinutes: mins });
+              if (mins > 0) resetAutoUnloadTimer(mins, s.lmStudioUrl);
+              else stopAutoUnloadTimer();
+              rebuildMenu();
+            },
+          })),
+        },
+      ],
+    };
   }
 
   function recordingMenu(s: AppSettings): Electron.MenuItemConstructorOptions {
@@ -294,7 +336,11 @@ export function createTray(
       { type: 'separator' },
       {
         label: 'Services',
-        submenu: [whisperMenu(s), kokoroMenu(s), llmMenu(s)],
+        submenu: [
+          whisperMenu(s), kokoroMenu(s), llmMenu(s),
+          { type: 'separator' },
+          powerMenu(s),
+        ],
       },
       recordingMenu(s),
       historyMenu(s),
