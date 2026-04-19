@@ -39,8 +39,10 @@ class AppSettings:
 
     # ── Whisper STT (child process) ──────────────────────────────────
     whisper_enabled: bool = True
-    whisper_auto_start: bool = False     # spawn at VoxType boot?
-                                         # False = lazy (first hotkey spawns it)
+    whisper_auto_start: bool = True      # spawn at VoxType boot so the
+                                         # first hotkey doesn't wait 5 s
+                                         # for model load. Set False if
+                                         # you want cold-start on demand.
     whisper_idle_unload_sec: int = 300   # 0 = never unload; otherwise
                                          # stop the child after N seconds
                                          # of no transcribe requests

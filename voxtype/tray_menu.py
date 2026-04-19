@@ -39,11 +39,17 @@ class Tray:
                  on_toggle_window: Callable[[], None],
                  on_quit: Callable[[], None],
                  on_restart_service: Callable[[str], None],
-                 on_proxy_ping: Callable[[], None]) -> None:
+                 on_proxy_ping: Callable[[], None],
+                 on_pill_reset: Callable[[], None] | None = None,
+                 on_pill_hide:  Callable[[], None] | None = None,
+                 on_pill_show:  Callable[[], None] | None = None) -> None:
         self._on_toggle_window = on_toggle_window
         self._on_quit = on_quit
         self._on_restart_service = on_restart_service
         self._on_proxy_ping = on_proxy_ping
+        self._on_pill_reset = on_pill_reset
+        self._on_pill_hide  = on_pill_hide
+        self._on_pill_show  = on_pill_show
 
         self.tray = QSystemTrayIcon(make_icon())
         self.tray.setToolTip("VoxType")
@@ -80,6 +86,16 @@ class Tray:
         ping = QAction("Test Proxy", self._llm_menu)
         ping.triggered.connect(lambda: on_proxy_ping())
         self._llm_menu.addAction(ping)
+
+        # ── Pill submenu ────────────────────────────────────────────
+        self._pill_menu = self.menu.addMenu("⬢ Pill")
+        self._pill_hide_show = QAction("Hide Pill", self._pill_menu)
+        self._pill_hide_show.triggered.connect(self._on_pill_hide_show_click)
+        self._pill_menu.addAction(self._pill_hide_show)
+        reset_pos = QAction("Reset Position", self._pill_menu)
+        reset_pos.triggered.connect(lambda: self._on_pill_reset and self._on_pill_reset())
+        self._pill_menu.addAction(reset_pos)
+        self._pill_is_hidden = False
 
         self.menu.addSeparator()
 
@@ -121,6 +137,18 @@ class Tray:
     def _on_activated(self, reason) -> None:
         if reason == QSystemTrayIcon.ActivationReason.Trigger:  # left click
             self._on_toggle_window()
+
+    def _on_pill_hide_show_click(self) -> None:
+        if self._pill_is_hidden:
+            if self._on_pill_show:
+                self._on_pill_show()
+            self._pill_is_hidden = False
+            self._pill_hide_show.setText("Hide Pill")
+        else:
+            if self._on_pill_hide:
+                self._on_pill_hide()
+            self._pill_is_hidden = True
+            self._pill_hide_show.setText("Show Pill")
 
     def _refresh(self) -> None:
         settings = config.load()

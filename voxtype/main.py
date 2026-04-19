@@ -88,13 +88,20 @@ class Orchestrator(QObject):
         self.pill = PillWindow()
         self.pill_state_req.connect(self._apply_pill_state)
 
-        self.window = SettingsWindow(restart_service=self._restart_service)
+        self.window = SettingsWindow(
+            restart_service=self._restart_service,
+            capture_hotkey=self._capture_hotkey,
+            set_hotkey=self._apply_hotkey,
+        )
 
         self.tray = Tray(
             on_toggle_window=self.window.toggle,
             on_quit=self.quit,
             on_restart_service=self._restart_service,
             on_proxy_ping=self._probe_proxy,
+            on_pill_reset=self.pill.reset_position,
+            on_pill_hide=self.pill.hide_for_session,
+            on_pill_show=self.pill.show_from_session,
         )
 
         # Hotkey
@@ -272,6 +279,22 @@ class Orchestrator(QObject):
         await services.start_whisper(services.WhisperConfig(
             model=s.whisper_model, port=s.whisper_port, device=s.whisper_device,
         ))
+
+    def _capture_hotkey(self, cb) -> None:
+        """Called by Settings → Dictation → Rebind. Forwards to the
+        live HotkeyListener so the next 1-2 key presses become the
+        new combo."""
+        try:
+            self.hotkey.capture(cb)
+        except Exception as exc:
+            log.error("hotkey.capture failed: %s", exc)
+
+    def _apply_hotkey(self, combo) -> None:
+        """Push a freshly-captured combo into the running listener."""
+        try:
+            self.hotkey.set_combo(combo)
+        except Exception as exc:
+            log.error("hotkey.set_combo failed: %s", exc)
 
     def _restart_service(self, name: str) -> None:
         s = config.load()

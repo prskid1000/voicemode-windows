@@ -233,7 +233,7 @@ class _TitleBar(QWidget):
 
 # ── Section builders ─────────────────────────────────────────────────
 
-def _build_dictation() -> QWidget:
+def _build_dictation(window) -> QWidget:
     scroll, _, layout = _page()
     card, body = _card("Dictation", "Hotkey, VAD, typing mode")
 
@@ -241,10 +241,46 @@ def _build_dictation() -> QWidget:
         "hold: dictate while the combo is held down. toggle: tap once to start, tap again to stop."),
         _combo("hotkey_mode", [("hold", "Hold"), ("toggle", "Toggle")])))
 
-    # Hotkey combo display (read-only for now; capture UI added later)
-    hk = config.load().hotkey
-    body.addWidget(_row(_label("Hotkey", "Currently-bound key combo. Edit via settings.json."),
-        _line_edit_static(hk.label)))
+    # Hotkey combo: live label + "Rebind" button that invokes
+    # HotkeyListener.capture() through the window. The button grabs the
+    # next 1–2 keys and persists the new combo.
+    hk_row = QWidget()
+    hk_l = QHBoxLayout(hk_row); hk_l.setContentsMargins(0, 0, 0, 0); hk_l.setSpacing(8)
+    hk_label = QLabel(config.load().hotkey.label)
+    hk_label.setStyleSheet("padding: 4px 8px; border: 1px solid #1e2636; border-radius: 4px; background: #0d1118;")
+    hk_label.setMinimumWidth(160)
+    rebind_btn = QPushButton("Rebind")
+    rebind_btn.setProperty("class", "ghost")
+
+    def _on_rebind():
+        from voxtype.types import HotkeyCombo as _HC
+        rebind_btn.setEnabled(False)
+        hk_label.setText("Press 1-2 keys…")
+        def _cb(combo: _HC) -> None:
+            # Persist + update the live HotkeyListener
+            config.patch("hotkey", {"key1": combo.key1, "key2": combo.key2, "label": combo.label})
+            from PySide6.QtCore import QTimer as _QT
+            def _refresh():
+                hk_label.setText(combo.label)
+                rebind_btn.setEnabled(True)
+                # Push the new combo into the live listener too
+                try:
+                    window.set_hotkey(combo)
+                except Exception:
+                    pass
+            _QT.singleShot(0, _refresh)
+        try:
+            window.capture_hotkey(_cb)
+        except Exception as exc:
+            log.error("rebind failed: %s", exc)
+            hk_label.setText(config.load().hotkey.label)
+            rebind_btn.setEnabled(True)
+
+    rebind_btn.clicked.connect(_on_rebind)
+    hk_l.addWidget(hk_label); hk_l.addStretch(1); hk_l.addWidget(rebind_btn)
+    body.addWidget(_row(_label("Hotkey",
+        "Click Rebind, then press the new 1–2 key combo. Colons, dots "
+        "and spaces are not allowed in key names."), hk_row))
 
     body.addWidget(_row(_label("Auto-Stop On Silence",
         "In hold-mode, stop recording if the mic stays quiet for a few seconds."),
@@ -715,9 +751,14 @@ def _build_logs(window) -> QWidget:
 # ── Window ───────────────────────────────────────────────────────────
 
 class SettingsWindow(QMainWindow):
-    def __init__(self, restart_service: Callable[[str], None]) -> None:
+    def __init__(self,
+                 restart_service: Callable[[str], None],
+                 capture_hotkey: Callable[[Callable], None] | None = None,
+                 set_hotkey: Callable[[object], None] | None = None) -> None:
         super().__init__()
         self._restart_service = restart_service
+        self._capture_hotkey = capture_hotkey
+        self._set_hotkey = set_hotkey
         self.setWindowTitle("VoxType")
         self.setWindowFlags(Qt.WindowType.FramelessWindowHint | Qt.WindowType.Window)
         self.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground, False)
@@ -761,6 +802,14 @@ class SettingsWindow(QMainWindow):
     def restart_service(self, name: str) -> None:
         self._restart_service(name)
 
+    def capture_hotkey(self, cb: Callable) -> None:
+        if self._capture_hotkey:
+            self._capture_hotkey(cb)
+
+    def set_hotkey(self, combo) -> None:
+        if self._set_hotkey:
+            self._set_hotkey(combo)
+
     def toggle(self) -> None:
         if self.isVisible():
             self.hide()
@@ -775,7 +824,7 @@ class SettingsWindow(QMainWindow):
         sid, _, _ = SECTIONS[row]
         if sid not in self._pages:
             if sid == "dictation":
-                w = _build_dictation()
+                w = _build_dictation(self)
             elif sid == "services":
                 w = _build_services(self)
             elif sid == "llm":
