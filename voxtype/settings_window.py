@@ -286,21 +286,35 @@ def _build_dictation(window) -> QWidget:
 
     def _on_rebind():
         from voxtype.types import HotkeyCombo as _HC
+        from PySide6.QtCore import QMetaObject, Q_ARG, Qt as _Qt
         rebind_btn.setEnabled(False)
         hk_label.setText("Press 1-2 keys…")
+
         def _cb(combo: _HC) -> None:
-            # Persist + update the live HotkeyListener
-            config.patch("hotkey", {"key1": combo.key1, "key2": combo.key2, "label": combo.label})
-            from PySide6.QtCore import QTimer as _QT
-            def _refresh():
-                hk_label.setText(combo.label)
-                rebind_btn.setEnabled(True)
-                # Push the new combo into the live listener too
-                try:
-                    window.set_hotkey(combo)
-                except Exception:
-                    pass
-            _QT.singleShot(0, _refresh)
+            """Fires on pynput's worker thread after the user presses
+            the new combo. config.patch + HotkeyListener.set_combo are
+            thread-safe, but Qt widget mutations MUST be marshalled to
+            the Qt thread or they're silently lost (the symptom the
+            user reported as "rebind doesn't work")."""
+            config.patch("hotkey", {
+                "key1": combo.key1, "key2": combo.key2, "label": combo.label,
+            })
+            try:
+                window.set_hotkey(combo)
+            except Exception as exc:
+                log.warning("set_hotkey on live listener failed: %s", exc)
+            # Qt-thread marshalling for the two widget mutations
+            QMetaObject.invokeMethod(
+                hk_label, "setText",
+                _Qt.ConnectionType.QueuedConnection,
+                Q_ARG(str, combo.label),
+            )
+            QMetaObject.invokeMethod(
+                rebind_btn, "setEnabled",
+                _Qt.ConnectionType.QueuedConnection,
+                Q_ARG(bool, True),
+            )
+
         try:
             window.capture_hotkey(_cb)
         except Exception as exc:

@@ -75,7 +75,8 @@ class _AsyncLoopThread:
 # ══════════════════════════════════════════════════════════════════════
 
 class Orchestrator(QObject):
-    pill_state_req = Signal(str, str)   # state, message — crosses thread boundary
+    pill_state_req  = Signal(str, str)    # state, message — cross-thread
+    flash_error_req = Signal(str, int)    # message, dwell_ms — cross-thread
 
     def __init__(self, app: QApplication, loop: _AsyncLoopThread) -> None:
         super().__init__()
@@ -87,6 +88,7 @@ class Orchestrator(QObject):
 
         self.pill = PillWindow()
         self.pill_state_req.connect(self._apply_pill_state)
+        self.flash_error_req.connect(self._apply_flash_error)
 
         self.window = SettingsWindow(
             restart_service=self._restart_service,
@@ -320,12 +322,21 @@ class Orchestrator(QObject):
         self.pill_state_req.emit(state, message)
 
     def _flash_error(self, message: str, dwell_ms: int = 2000) -> None:
-        self.pill_state_req.emit("error", message)
-        QTimer.singleShot(dwell_ms, lambda: self.pill_state_req.emit("idle", ""))
+        """Thread-safe: emit a signal that's handled on the Qt thread.
+        The previous implementation called QTimer.singleShot directly
+        from pynput's worker thread, which has no Qt event loop — the
+        reset-to-idle timer never fired and the pill got stuck red."""
+        self.flash_error_req.emit(message, int(dwell_ms))
 
     @Slot(str, str)
     def _apply_pill_state(self, state: str, message: str) -> None:
         self.pill.set_state(state, message)  # type: ignore[arg-type]
+
+    @Slot(str, int)
+    def _apply_flash_error(self, message: str, dwell_ms: int) -> None:
+        """Runs on the Qt thread. Safe to start QTimer here."""
+        self.pill.set_state("error", message)  # type: ignore[arg-type]
+        QTimer.singleShot(dwell_ms, lambda: self.pill.set_state("idle", ""))  # type: ignore[arg-type]
 
     # ── Quit ────────────────────────────────────────────────────────
 

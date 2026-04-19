@@ -347,7 +347,13 @@ def _kill_tree(pid: int, force: bool) -> None:
     if force:
         args.append("/F")
     try:
-        subprocess.run(args, capture_output=True, timeout=5.0, check=False)
+        # CREATE_NO_WINDOW prevents a console flash when telecode is run
+        # under pythonw.exe — taskkill is a console-subsystem exe, so
+        # Windows would otherwise allocate a fresh console for it.
+        subprocess.run(
+            args, capture_output=True, timeout=5.0, check=False,
+            creationflags=subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0,
+        )
     except Exception:
         pass
 
