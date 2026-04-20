@@ -16,7 +16,7 @@ from PySide6.QtCore import QTimer
 from PySide6.QtGui import QAction, QIcon, QPixmap
 from PySide6.QtWidgets import QApplication, QMenu, QSystemTrayIcon
 
-from voxtype import config, services
+from voxtype import config, process
 from voxtype.qt_theme import QSS
 
 log = logging.getLogger("voxtype.tray")
@@ -160,7 +160,7 @@ class Tray:
 
         # Whisper
         if settings.whisper_enabled:
-            s = services.get_status("whisper")
+            s = process.get_status("whisper")
             if s.running and s.ready:
                 self._whisper_menu.setTitle(f"⬢ Whisper: Ready :{settings.whisper_port}")
                 self._whisper_status.setText(f"PID {s.pid} · port {settings.whisper_port}")
@@ -176,7 +176,7 @@ class Tray:
 
         # Kokoro
         if settings.kokoro_enabled:
-            s = services.get_status("kokoro")
+            s = process.get_status("kokoro")
             if s.running and s.ready:
                 self._kokoro_menu.setTitle(f"⬢ Kokoro: Ready :{settings.kokoro_port}")
                 self._kokoro_status.setText(f"PID {s.pid} · port {settings.kokoro_port}")

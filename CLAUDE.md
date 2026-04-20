@@ -49,7 +49,7 @@ voxtype/
     │
     ├── stt.py                 # Multipart POST to faster-whisper-server
     ├── llm.py                 # OpenAI-shape POST to telecode proxy; JSON-schema; LRU cache
-    ├── services.py            # Subprocess supervisor (Whisper + Kokoro, taskkill /T, auto-restart)
+    ├── process.py             # Subprocess lifecycle — Whisper + Kokoro supervisor, Job Object crash-safety, port sweep, auto-restart
     ├── whisper_model.py       # Model catalog
     ├── kokoro_voice.py        # Voice catalog + warmup ping
     │
@@ -123,18 +123,33 @@ the corresponding section of the settings window.
 `VOXTYPE_DATA_DIR` env var overrides the default `voxtype/data/` path
 if you want settings/history/logs somewhere else.
 
-## Sidecar lifecycle (`services.py`)
+## Sidecar lifecycle (`process.py`)
 
-Mirrors telecode's `llamacpp/supervisor.py` pattern.
+Everything subprocess-related lives in one file, mirroring telecode's
+`process.py`. Two layers:
 
+**Generic primitives** (top)
+- Windows kill-on-close Job Object (`_bind_to_lifetime_job`) — every
+  spawned child dies with the interpreter even on Task Manager End
+  Process / pythonw crash / logoff. Prevents orphans holding our port.
+- `_sweep_port(name, port)` — command-line-aware orphan killer.
+  Matches on both the owning exe and argv (since sidecars under our
+  venv are often launched by pyenv's python.exe).
+- `_kill_tree` — `taskkill /T` walks the parent-PID map.
+- `atexit` fallback for clean-exit paths where the Job Object wasn't
+  available (pywin32 missing).
+
+**Sidecar supervisors** (bottom)
 - `start_whisper(cfg)` / `start_kokoro(cfg)` — spawn + `_drain` stdout
-  into the log + probe `/health` up to 60 s
+  into the log + `_wait_ready` probe `/health` (poll-death guard +
+  post-probe stability check to catch an orphan answering on our port).
 - `_watch_exit(m)` — auto-restart on unexpected exit with exponential
-  backoff (1s, 2s, 4s, …, capped at 30s); suppressed when
-  `m.stopping == True`
+  backoff (1s, 2s, 4s, …, capped at 30s); the scheduled restart no-ops
+  if a lazy `_ensure_*_running()` already revived the service, so we
+  don't double-spawn and lose the bind race.
 - `stop_service(name)` — `taskkill /PID <pid> /T` (graceful), 3 s
-  wait, then `/F` if still alive
-- `stop_all()` — concurrent stop of every managed service
+  wait, then `/F` if still alive.
+- `stop_all()` — concurrent stop of every managed service.
 
 All spawned children carry `subprocess.CREATE_NO_WINDOW` so they don't
 pop a console under `pythonw.exe`.

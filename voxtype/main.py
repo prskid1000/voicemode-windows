@@ -25,7 +25,7 @@ from typing import Optional
 from PySide6.QtCore import Qt, QObject, QTimer, Signal, Slot, QCoreApplication
 from PySide6.QtWidgets import QApplication
 
-from voxtype import config, debug_log, services, stt, llm
+from voxtype import config, debug_log, process, stt, llm
 from voxtype.audio import Recorder
 from voxtype.hotkey import HotkeyListener
 from voxtype.pill_window import PillWindow
@@ -203,7 +203,7 @@ class Orchestrator(QObject):
             self._flash_error("Whisper failed to start")
             return
 
-        services.mark_used("whisper")
+        process.mark_used("whisper")
         try:
             raw = await stt.transcribe(pcm, f"http://127.0.0.1:{s.whisper_port}")
             log.info("STT: %r", (raw[:120] + "…") if len(raw) > 120 else raw)
@@ -285,17 +285,17 @@ class Orchestrator(QObject):
         # Register idle-unload thresholds even for services we haven't
         # spawned yet — when they come up later, the watcher already knows
         # their timeout.
-        services.set_idle_unload("whisper", s.whisper_idle_unload_sec)
-        services.set_idle_unload("kokoro",  s.kokoro_idle_unload_sec)
-        services.start_idle_watcher()
+        process.set_idle_unload("whisper", s.whisper_idle_unload_sec)
+        process.set_idle_unload("kokoro",  s.kokoro_idle_unload_sec)
+        process.start_idle_watcher()
 
         tasks = []
         if s.whisper_enabled and s.whisper_auto_start:
-            tasks.append(services.start_whisper(services.WhisperConfig(
+            tasks.append(process.start_whisper(process.WhisperConfig(
                 model=s.whisper_model, port=s.whisper_port, device=s.whisper_device,
             )))
         if s.kokoro_enabled and s.kokoro_auto_start:
-            tasks.append(services.start_kokoro(services.KokoroConfig(
+            tasks.append(process.start_kokoro(process.KokoroConfig(
                 port=s.kokoro_port, device=s.kokoro_device,
             )))
         if tasks:
@@ -309,9 +309,9 @@ class Orchestrator(QObject):
         s = config.load()
         if not s.whisper_enabled:
             return
-        if services.is_running("whisper"):
+        if process.is_running("whisper"):
             return
-        await services.start_whisper(services.WhisperConfig(
+        await process.start_whisper(process.WhisperConfig(
             model=s.whisper_model, port=s.whisper_port, device=s.whisper_device,
         ))
 
@@ -334,12 +334,12 @@ class Orchestrator(QObject):
     def _restart_service(self, name: str) -> None:
         s = config.load()
         if name == "whisper":
-            cfg = services.WhisperConfig(
+            cfg = process.WhisperConfig(
                 model=s.whisper_model, port=s.whisper_port, device=s.whisper_device,
             )
         else:
-            cfg = services.KokoroConfig(port=s.kokoro_port, device=s.kokoro_device)
-        self._loop.submit(services.restart_service(name, cfg))
+            cfg = process.KokoroConfig(port=s.kokoro_port, device=s.kokoro_device)
+        self._loop.submit(process.restart_service(name, cfg))
 
     def _probe_proxy(self) -> None:
         async def _do():
@@ -380,7 +380,7 @@ class Orchestrator(QObject):
         except Exception:
             pass
         # Kick off async shutdown of sidecars + proxy
-        fut = self._loop.submit(services.stop_all())
+        fut = self._loop.submit(process.stop_all())
         try:
             fut.result(timeout=6.0)
         except Exception:

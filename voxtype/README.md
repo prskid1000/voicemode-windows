@@ -14,9 +14,11 @@ any app. Drop-in replacement for the `voxtype/` Electron app.
   `http://127.0.0.1:1235/v1/chat/completions`. Model selection is a
   string in settings — telecode handles the actual loading and routing.
 - **Whisper + Kokoro stay as child processes.** The supervisor in
-  `services.py` spawns `faster-whisper-server.exe` and Kokoro's uvicorn,
-  probes `/health`, auto-restarts with exponential backoff, and reaps
-  via `taskkill /T` on quit — same lifecycle as the TS version.
+  `process.py` spawns `faster-whisper-server.exe` and Kokoro's uvicorn,
+  binds each to a Windows kill-on-close Job Object, probes `/health`
+  (with poll-death + post-probe stability guards so an orphan on our
+  port can't fake "ready"), auto-restarts with exponential backoff, and
+  reaps via `taskkill /T` on quit.
 
 ## Run
 
@@ -44,7 +46,7 @@ voxtype/
   vad.py               # numpy RMS on PCM
   screen_capture.py    # mss + PIL, red cursor marker
   history.py           # append-only JSON
-  services.py          # supervisor for Whisper + Kokoro sidecars
+  process.py           # subprocess lifecycle: Whisper + Kokoro supervisor, Job Object, port sweep
   tray_menu.py         # QSystemTrayIcon + submenus
   pill_window.py       # frameless always-on-top status pill
   settings_window.py   # sidebar + cards (Dictation / Services / LLM / About)

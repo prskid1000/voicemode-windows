@@ -1,21 +1,31 @@
-"""Subprocess supervisor for Whisper and Kokoro sidecars.
+"""Subprocess lifecycle — everything process-related for VoxType.
 
-Ported from voxtype/src/main/services.ts. Spawns faster-whisper-server
-and Kokoro-FastAPI as child processes, probes their /health endpoints,
-auto-restarts on crash with exponential backoff. Graceful `taskkill /T`
-first, then force kill if needed.
+Layers (top → bottom of file):
+1. **Generic primitives** — port probe, tree-kill, command-line-aware
+   orphan sweep, Windows Job Object (kill-on-close), readiness probe
+   with poll-death guard.
+2. **Sidecar supervisors** — Whisper + Kokoro child-process lifecycle
+   (spawn env, stdout drain, auto-restart with exponential backoff,
+   idle-unload, GPU-broken → CPU fallback, graceful stop).
+
+The Job Object binds every spawned sidecar to the Python interpreter's
+lifetime: if VoxType dies for ANY reason (Ctrl+C, Task Manager End
+Process, pythonw crash, logoff) Windows kills the whole tree. This is
+what prevents the orphan-holding-our-port restart loop that motivated
+the consolidation.
 
 Windows-specific: CREATE_NO_WINDOW so children don't pop a console."""
 from __future__ import annotations
 
 import asyncio
+import atexit
 import logging
 import os
 import socket
 import subprocess
 import threading
 import time
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Callable, Literal
 
@@ -23,7 +33,7 @@ import aiohttp
 
 from voxtype import config as _config
 
-log = logging.getLogger("voxtype.services")
+log = logging.getLogger("voxtype.process")
 
 ServiceName = Literal["whisper", "kokoro"]
 DeviceMode = Literal["gpu", "cpu"]
@@ -205,6 +215,96 @@ def _uvicorn_exe() -> Path:
     return TTS_VENV / "Scripts" / "uvicorn.exe"
 
 
+# ── Kill-on-close Job Object (Windows crash-safety) ──────────────────
+#
+# Every sidecar we spawn is assigned to a single process-wide Job Object
+# flagged KILL_ON_JOB_CLOSE. The Job handle lives in `_JOB_HANDLE` for
+# the lifetime of the interpreter — when Python exits for ANY reason
+# (clean quit, Ctrl+C, pythonw crash, Task Manager End Process, OS
+# logoff) the Job closes and Windows terminates every assigned
+# process. This is what prevents the stale-sidecar-holds-our-port
+# restart loop that motivated consolidating everything into this file.
+#
+# atexit fallback handles the narrow case where Job Object creation
+# failed (pywin32 missing): on clean interpreter exit we proc.kill()
+# every tracked child. It can't help against hard kills — that's what
+# the Job Object is for.
+
+_JOB_HANDLE = None
+_TRACKED_PIDS: set[int] = set()
+_TRACKED_PROCS: list[subprocess.Popen] = []
+
+
+def _create_kill_on_close_job():
+    """Idempotent: create the process-wide Job Object on first call."""
+    global _JOB_HANDLE
+    if os.name != "nt" or _JOB_HANDLE is not None:
+        return _JOB_HANDLE
+    try:
+        import win32job
+        job = win32job.CreateJobObject(None, "")
+        info = win32job.QueryInformationJobObject(
+            job, win32job.JobObjectExtendedLimitInformation
+        )
+        info["BasicLimitInformation"]["LimitFlags"] |= (
+            win32job.JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE
+        )
+        win32job.SetInformationJobObject(
+            job, win32job.JobObjectExtendedLimitInformation, info
+        )
+        _JOB_HANDLE = job
+        log.info("created kill-on-close Job Object")
+    except Exception as exc:
+        log.warning("could not create Job Object (orphans possible "
+                    "on hard-kill of voxtype): %s", exc)
+    return _JOB_HANDLE
+
+
+def _bind_to_lifetime_job(proc: subprocess.Popen) -> bool:
+    """Bind `proc` to the kill-on-close Job Object so Windows reaps it
+    if this interpreter dies unexpectedly. Tracks the Popen for the
+    atexit fallback regardless of whether the Job bind succeeds."""
+    if proc not in _TRACKED_PROCS:
+        _TRACKED_PROCS.append(proc)
+    if os.name != "nt" or proc.pid <= 0 or proc.pid in _TRACKED_PIDS:
+        return True
+    job = _create_kill_on_close_job()
+    if job is None:
+        return False
+    try:
+        import win32api
+        import win32con
+        import win32job
+        ph = win32api.OpenProcess(win32con.PROCESS_ALL_ACCESS, False, proc.pid)
+        try:
+            win32job.AssignProcessToJobObject(job, ph)
+        finally:
+            win32api.CloseHandle(ph)
+        _TRACKED_PIDS.add(proc.pid)
+        return True
+    except Exception as exc:
+        log.warning("could not assign PID %d to Job Object: %s", proc.pid, exc)
+        return False
+
+
+def _atexit_kill_tracked() -> None:
+    """Clean-exit fallback when the Job Object path isn't available.
+    Hard-kill paths (SIGKILL, OS shutdown) are covered by the Job itself."""
+    for proc in list(_TRACKED_PROCS):
+        try:
+            if proc.poll() is None:
+                proc.kill()
+                try:
+                    proc.wait(timeout=2)
+                except Exception:
+                    pass
+        except Exception:
+            pass
+
+
+atexit.register(_atexit_kill_tracked)
+
+
 # ── Orphan sweep ─────────────────────────────────────────────────────
 
 def _port_in_use(port: int) -> bool:
@@ -313,11 +413,13 @@ def _spawn_whisper(cfg: WhisperConfig) -> subprocess.Popen:
     env["PYTHONUNBUFFERED"] = "1"
     args = [str(_whisper_exe()), cfg.model, "--host", "127.0.0.1",
             "--port", str(cfg.port)]
-    return subprocess.Popen(
+    proc = subprocess.Popen(
         args, env=env, stdin=subprocess.DEVNULL,
         stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
         creationflags=subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0,
     )
+    _bind_to_lifetime_job(proc)
+    return proc
 
 
 def _spawn_kokoro(cfg: KokoroConfig) -> subprocess.Popen:
@@ -334,12 +436,14 @@ def _spawn_kokoro(cfg: KokoroConfig) -> subprocess.Popen:
     })
     args = [str(_uvicorn_exe()), "api.src.main:app",
             "--host", "127.0.0.1", "--port", str(cfg.port)]
-    return subprocess.Popen(
+    proc = subprocess.Popen(
         args, env=env, cwd=str(KOKORO_REPO),
         stdin=subprocess.DEVNULL,
         stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
         creationflags=subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0,
     )
+    _bind_to_lifetime_job(proc)
+    return proc
 
 
 # ── Health probe ─────────────────────────────────────────────────────
