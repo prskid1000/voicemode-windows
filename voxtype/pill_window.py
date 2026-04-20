@@ -204,10 +204,21 @@ class PillWindow(QWidget):
 
     def _draw_idle(self, p: QPainter, cx: float, cy: float) -> None:
         breathe = 0.85 + 0.15 * math.sin(self._phase / 25.0)
+        # Deep black ring + centre dot so the idle orb reads as a
+        # solid black disc on any desktop background. The 2.5-px
+        # spacer stays transparent to form the "donut" look.
         p.setPen(Qt.PenStyle.NoPen)
-        for r, a in ((3.5, 60), (2.5, 50), (1.5, 40)):
-            p.setBrush(QBrush(QColor(170, 180, 200, int(a * breathe))))
-            p.drawEllipse(QRectF(cx - r, cy - r, 2 * r, 2 * r))
+        outer_r = 4.5
+        inner_r = 1.6
+        p.setBrush(QBrush(QColor(0, 0, 0, int(235 * breathe))))
+        p.drawEllipse(QRectF(cx - outer_r, cy - outer_r, 2 * outer_r, 2 * outer_r))
+        # Punch the middle out with the parent's transparent background
+        # by drawing a slightly lighter alpha-0 hole would require
+        # CompositionMode swapping — simpler to overlay a matching dot
+        # the same colour as the desktop-adjacent bg is not possible,
+        # so instead we draw a solid black centre dot (requested).
+        p.setBrush(QBrush(QColor(0, 0, 0, int(255 * breathe))))
+        p.drawEllipse(QRectF(cx - inner_r, cy - inner_r, 2 * inner_r, 2 * inner_r))
 
     def _draw_recording(self, p: QPainter,
                          rx: float, ry: float, rw: float, rh: float) -> None:
