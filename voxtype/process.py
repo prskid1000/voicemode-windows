@@ -744,18 +744,22 @@ async def stop_service(name: ServiceName) -> None:
         return
     m.stopping = True
     m.restart_count = 0
-    if m.proc is None or m.proc.poll() is not None:
+    # Capture proc locally: the _watch_exit thread can clear m.proc to None
+    # the moment the child dies, and our subsequent awaits would then call
+    # .poll() on None. Hold the Popen for the lifetime of this coroutine.
+    proc = m.proc
+    if proc is None or proc.poll() is not None:
         m.proc = None
         m.ready = False
         _notify(name)
         return
-    pid = m.proc.pid
+    pid = proc.pid
     log.info("stopping %s (PID %d)...", name, pid)
     _kill_tree(pid, force=False)
-    if not await _wait_exit(m.proc, 3.0):
+    if not await _wait_exit(proc, 3.0):
         log.info("%s did not exit gracefully — forceful kill", name)
         _kill_tree(pid, force=True)
-        await _wait_exit(m.proc, 2.0)
+        await _wait_exit(proc, 2.0)
     m.proc = None
     m.ready = False
     _notify(name)
