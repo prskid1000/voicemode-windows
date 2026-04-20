@@ -83,11 +83,6 @@ class Orchestrator(QObject):
         self._app = app
         self._loop = loop
         self._recording_since: float = 0.0
-        # Track the in-flight pipeline so a new hotkey can cancel it
-        # before queueing another STT/LLM request behind the stuck one.
-        # concurrent.futures.Future from run_coroutine_threadsafe; calling
-        # .cancel() schedules the asyncio Task for cancellation on the loop.
-        self._current_future = None  # type: ignore[var-annotated]
 
         self.recorder = Recorder()
 
@@ -129,38 +124,10 @@ class Orchestrator(QObject):
 
     # ── Pipeline ─────────────────────────────────────────────────────
 
-    def _cancel_in_flight(self, reason: str) -> None:
-        """Cancel any pipeline still running an STT/LLM/paste await.
-
-        This is the real fix for the "back-to-back dictations pile up
-        behind llama.cpp and each one takes 90 s" problem. Cancelling
-        the asyncio task closes the aiohttp session mid-request, which
-        surfaces as a client disconnect on the Whisper / proxy server
-        — the server can then abort its work instead of finishing a
-        stale request the user no longer cares about."""
-        fut = self._current_future
-        if fut is None:
-            return
-        if fut.done():
-            self._current_future = None
-            return
-        log.info("cancelling in-flight pipeline (%s)", reason)
-        try:
-            fut.cancel()
-        except Exception as exc:
-            log.debug("cancel failed: %s", exc)
-        self._current_future = None
-
     def _on_hotkey_down(self) -> None:
         """Hotkey pressed — start recording."""
         if self.recorder.recording:
             return
-        # New capture starts → abandon any still-running STT/LLM from the
-        # previous turn. If the user is spamming the hotkey the old pipeline
-        # is stale anyway and its response would overwrite whatever they're
-        # typing now. This is also what prevents llama.cpp's per-request
-        # queue from stacking up requests we no longer need.
-        self._cancel_in_flight("new hotkey down")
         s = config.load()
         silence_dur = float(s.silence_duration_sec) if s.auto_stop_on_silence else 0.0
         log.info("hotkey down — start recording (silence auto-stop: %s)",
@@ -204,21 +171,10 @@ class Orchestrator(QObject):
             return
 
         self._set_pill("processing", "")
-        self._current_future = self._loop.submit(self._pipeline(pcm, s))
+        self._loop.submit(self._pipeline(pcm, s))
 
     async def _pipeline(self, pcm: bytes, s: AppSettings) -> None:
         """Async half of the dictation pipeline."""
-        try:
-            await self._pipeline_body(pcm, s)
-        except asyncio.CancelledError:
-            # New hotkey pressed while this one was mid-STT/LLM/paste.
-            # Don't touch the pill — the new turn has already set it to
-            # "recording". Swallow and exit so the task doesn't propagate
-            # CancelledError into the asyncio loop's exception handler.
-            log.info("pipeline cancelled — new hotkey took over")
-            return
-
-    async def _pipeline_body(self, pcm: bytes, s: AppSettings) -> None:
         t0 = time.monotonic()
         raw = ""
         # Idle-unload may have stopped Whisper; (re)spawn if needed.
