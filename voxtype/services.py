@@ -11,6 +11,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import os
+import socket
 import subprocess
 import threading
 import time
@@ -204,6 +205,89 @@ def _uvicorn_exe() -> Path:
     return TTS_VENV / "Scripts" / "uvicorn.exe"
 
 
+# ── Orphan sweep ─────────────────────────────────────────────────────
+
+def _port_in_use(port: int) -> bool:
+    """Return True if something is listening on 127.0.0.1:<port>."""
+    try:
+        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+            s.settimeout(0.5)
+            return s.connect_ex(("127.0.0.1", port)) == 0
+    except Exception:
+        return False
+
+
+def _pids_listening_on(port: int) -> list[int]:
+    """PIDs of processes holding 127.0.0.1:<port> in LISTEN state.
+    Uses Get-NetTCPConnection (no admin needed)."""
+    if os.name != "nt":
+        return []
+    ps = (
+        "$c = Get-NetTCPConnection -LocalAddress 127.0.0.1 "
+        f"-LocalPort {int(port)} -State Listen -ErrorAction SilentlyContinue; "
+        "if ($c) { $c.OwningProcess | Sort-Object -Unique }"
+    )
+    try:
+        out = subprocess.run(
+            ["powershell.exe", "-NoProfile", "-NonInteractive", "-Command", ps],
+            capture_output=True, text=True, timeout=5.0, check=False,
+            creationflags=subprocess.CREATE_NO_WINDOW,
+        ).stdout
+    except Exception:
+        return []
+    pids: list[int] = []
+    for line in out.splitlines():
+        line = line.strip()
+        if line.isdigit():
+            pids.append(int(line))
+    return pids
+
+
+def _process_image(pid: int) -> str:
+    """Full executable path of a PID, or "" if unknown."""
+    if os.name != "nt":
+        return ""
+    ps = (
+        f"(Get-Process -Id {int(pid)} -ErrorAction SilentlyContinue)."
+        "Path"
+    )
+    try:
+        out = subprocess.run(
+            ["powershell.exe", "-NoProfile", "-NonInteractive", "-Command", ps],
+            capture_output=True, text=True, timeout=5.0, check=False,
+            creationflags=subprocess.CREATE_NO_WINDOW,
+        ).stdout
+    except Exception:
+        return ""
+    return out.strip()
+
+
+def _sweep_port(name: ServiceName, port: int) -> None:
+    """If an orphan from a previous VoxType run is holding `port`, kill it.
+    Only targets processes whose image lives under our sidecar venv, so a
+    misconfigured port collision with an unrelated app won't murder it."""
+    if not _port_in_use(port):
+        return
+    venv_root = STT_VENV if name == "whisper" else TTS_VENV
+    venv_str = str(venv_root).lower()
+    pids = _pids_listening_on(port)
+    for pid in pids:
+        image = _process_image(pid).lower()
+        if image and image.startswith(venv_str):
+            log.warning("[%s] port %d held by orphan PID %d (%s) — killing",
+                        name, port, pid, image)
+            _kill_tree(pid, force=True)
+        else:
+            log.error("[%s] port %d in use by foreign PID %d (%s) — "
+                      "not killing; service will fail to bind",
+                      name, port, pid, image or "unknown")
+    # Give the OS a moment to release the socket.
+    for _ in range(20):
+        if not _port_in_use(port):
+            return
+        time.sleep(0.1)
+
+
 # ── Spawn helpers ────────────────────────────────────────────────────
 
 def _spawn_whisper(cfg: WhisperConfig) -> subprocess.Popen:
@@ -260,7 +344,7 @@ async def _ping_once(url: str, timeout: float = 1.5) -> bool:
         return False
 
 
-async def _wait_ready(name: ServiceName, url: str,
+async def _wait_ready(m: _Managed, url: str,
                       total_timeout: float = 600.0) -> bool:
     """Poll /health until the service answers or we hit total_timeout.
 
@@ -271,12 +355,20 @@ async def _wait_ready(name: ServiceName, url: str,
     minutes. The previous 60s cap aborted mid-download and left
     whisper in an inconsistent state.
 
+    Also bails out early if the child process exits. Without this check
+    an orphan on the same port would answer /health and we'd falsely
+    report our dead child as "ready after 0.0s".
+
     A periodic log line confirms we're still waiting rather than dead."""
+    name = m.name
     start = time.monotonic()
     attempts = 0
     next_heartbeat = 30.0
     while (time.monotonic() - start) < total_timeout:
         attempts += 1
+        if m.proc is None or m.proc.poll() is not None:
+            log.warning("%s exited before becoming ready", name)
+            return False
         if await _ping_once(url):
             log.info("%s ready after %.1fs (%d attempts)",
                      name, time.monotonic() - start, attempts)
@@ -394,6 +486,12 @@ async def _start_internal(m: _Managed) -> None:
         return
 
     log.info("starting %s...", m.name)
+    # If a previous VoxType died without cleaning up its sidecar, the port
+    # is still held by the orphan — the new child will exit with bind error
+    # 10048. Kill the orphan first so we can bind.
+    port = getattr(m.config, "port", 0)
+    if port:
+        _sweep_port(m.name, int(port))
     m.proc = (_spawn_whisper(m.config)  # type: ignore[arg-type]
               if m.name == "whisper"
               else _spawn_kokoro(m.config))  # type: ignore[arg-type]
@@ -409,7 +507,7 @@ async def _start_internal(m: _Managed) -> None:
         name=f"voxtype-{m.name}-watcher",
     ).start()
 
-    ready = await _wait_ready(m.name, _health_url(m))
+    ready = await _wait_ready(m, _health_url(m))
     m.ready = ready
     if not ready:
         m.last_error = "service did not become ready"
@@ -438,6 +536,15 @@ def _watch_exit(m: _Managed) -> None:
 
     def _later():
         time.sleep(delay)
+        # If the lazy `_ensure_*_running()` path already brought the service
+        # back up while we were waiting, don't spawn a duplicate — it would
+        # lose the port-bind race and trigger another crash-restart cycle.
+        if m.proc is not None and m.proc.poll() is None:
+            log.info("%s already running (PID %d) — skipping scheduled restart",
+                     m.name, m.proc.pid)
+            return
+        if m.stopping:
+            return
         try:
             asyncio.run(_start_internal(m))
         except Exception as exc:
