@@ -203,22 +203,23 @@ class PillWindow(QWidget):
     # ── Glyphs ───────────────────────────────────────────────────────
 
     def _draw_idle(self, p: QPainter, cx: float, cy: float) -> None:
-        breathe = 0.85 + 0.15 * math.sin(self._phase / 25.0)
-        # Deep black ring + centre dot so the idle orb reads as a
-        # solid black disc on any desktop background. The 2.5-px
-        # spacer stays transparent to form the "donut" look.
+        breathe = 0.80 + 0.20 * math.sin(self._phase / 25.0)
+        # Square black border hugging the widget bounds, with a small
+        # filled centre dot. Slightly rounded corners keep edges clean.
+        stroke = 3.0
+        pen = QPen(QColor(0, 0, 0, 255), stroke)
+        pen.setJoinStyle(Qt.PenJoinStyle.MiterJoin)
+        p.setPen(pen)
+        p.setBrush(Qt.BrushStyle.NoBrush)
+        inset = stroke / 2
+        p.drawRoundedRect(
+            QRectF(inset, inset, self.width() - 2 * inset, self.height() - 2 * inset),
+            2.5, 2.5,
+        )
         p.setPen(Qt.PenStyle.NoPen)
-        outer_r = 4.5
-        inner_r = 1.6
-        p.setBrush(QBrush(QColor(0, 0, 0, int(235 * breathe))))
-        p.drawEllipse(QRectF(cx - outer_r, cy - outer_r, 2 * outer_r, 2 * outer_r))
-        # Punch the middle out with the parent's transparent background
-        # by drawing a slightly lighter alpha-0 hole would require
-        # CompositionMode swapping — simpler to overlay a matching dot
-        # the same colour as the desktop-adjacent bg is not possible,
-        # so instead we draw a solid black centre dot (requested).
-        p.setBrush(QBrush(QColor(0, 0, 0, int(255 * breathe))))
-        p.drawEllipse(QRectF(cx - inner_r, cy - inner_r, 2 * inner_r, 2 * inner_r))
+        core_r = 2.4 * breathe
+        p.setBrush(QBrush(QColor(0, 0, 0, 255)))
+        p.drawEllipse(QRectF(cx - core_r, cy - core_r, 2 * core_r, 2 * core_r))
 
     def _draw_recording(self, p: QPainter,
                          rx: float, ry: float, rw: float, rh: float) -> None:
