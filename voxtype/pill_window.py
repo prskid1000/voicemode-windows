@@ -214,7 +214,7 @@ class PillWindow(QWidget):
         inset = stroke / 2
         p.drawRoundedRect(
             QRectF(inset, inset, self.width() - 2 * inset, self.height() - 2 * inset),
-            2.5, 2.5,
+            6.0, 6.0,
         )
         p.setPen(Qt.PenStyle.NoPen)
         core_r = 2.4 * breathe
