@@ -20,10 +20,45 @@ from typing import Callable, Literal
 
 import aiohttp
 
+from voxtype import config as _config
+
 log = logging.getLogger("voxtype.services")
 
 ServiceName = Literal["whisper", "kokoro"]
 DeviceMode = Literal["gpu", "cpu"]
+
+
+def _service_log_path(name: ServiceName) -> Path:
+    return _config.data_dir() / f"{name}.log"
+
+
+def _rotate_service_log(name: ServiceName) -> Path:
+    """Move <name>.log → <name>.log.prev and return the path to write into.
+    Best-effort: if rotation fails (file held by another process), append."""
+    cur = _service_log_path(name)
+    prev = cur.with_suffix(".log.prev")
+    try:
+        cur.parent.mkdir(parents=True, exist_ok=True)
+        if cur.exists():
+            if prev.exists():
+                prev.unlink()
+            cur.rename(prev)
+    except Exception:
+        pass
+    return cur
+
+
+# Strings the Whisper subprocess prints when CUDA / cuBLAS isn't usable. When
+# we see one we mark the service as GPU-broken; the next start_whisper() call
+# will silently switch to CPU mode regardless of what the user has configured.
+_GPU_BROKEN_MARKERS = (
+    "cublas64_",                # cublas64_12.dll / cublas64_11.dll missing
+    "cudnn",                    # cudnn DLL load failure
+    "Library cublas",
+    "CUDA driver version",
+    "no kernel image is available for execution on the device",
+)
+_gpu_broken: dict[ServiceName, bool] = {}
 
 
 INSTALL_DIR = Path(os.path.expanduser("~")) / ".voxtype"
@@ -237,19 +272,87 @@ async def _wait_ready(name: ServiceName, url: str,
 # ── stdout/stderr drain ──────────────────────────────────────────────
 
 def _drain(name: ServiceName, proc: subprocess.Popen) -> None:
+    """Pump the child's combined stdout into a dedicated log file.
+
+    Writes go to <data_dir>/<name>.log (rotated to .prev each spawn). Only
+    a one-line breadcrumb lands in the main voxtype.log so the merged
+    timeline still shows that the service was alive, but the noisy
+    per-request lines stay out of the main log.
+
+    Also sniffs each line for `_GPU_BROKEN_MARKERS`. The first match flips
+    `_gpu_broken[name]`, fires a one-time warning into the main log, and
+    schedules a stop+restart with `device='cpu'`. That recovers the
+    user's next dictation without manual intervention when CUDA is
+    misconfigured (cublas DLLs missing, etc.).
+    """
+    log_path = _rotate_service_log(name)
+    try:
+        sink = open(log_path, "ab", buffering=0)
+    except Exception as exc:
+        log.warning("could not open %s for writing: %s", log_path, exc)
+        sink = None
+    log.info("[%s] writing subprocess log to %s", name, log_path)
+
     def _reader():
         try:
             if proc.stdout is None:
                 return
             for line in iter(proc.stdout.readline, b""):
                 text = line.decode("utf-8", errors="replace").rstrip()
-                if text:
-                    log.info("[%s] %s", name, text)
+                if not text:
+                    continue
+                if sink is not None:
+                    try:
+                        sink.write(line if line.endswith(b"\n") else line + b"\n")
+                    except Exception:
+                        pass
+                if not _gpu_broken.get(name) and any(
+                    m.lower() in text.lower() for m in _GPU_BROKEN_MARKERS
+                ):
+                    _gpu_broken[name] = True
+                    log.warning(
+                        "[%s] GPU appears broken (saw %r in subprocess output) "
+                        "— scheduling restart on CPU. Install matching CUDA / "
+                        "cuBLAS DLLs to keep using GPU.",
+                        name, text[:160],
+                    )
+                    threading.Thread(
+                        target=_force_cpu_restart, args=(name,),
+                        daemon=True, name=f"voxtype-{name}-cpu-restart",
+                    ).start()
         except Exception:
             pass
+        finally:
+            if sink is not None:
+                try:
+                    sink.close()
+                except Exception:
+                    pass
+
     t = threading.Thread(target=_reader, daemon=True,
                          name=f"voxtype-{name}-reader")
     t.start()
+
+
+def _force_cpu_restart(name: ServiceName) -> None:
+    """Stop the service and respawn with device='cpu'. Called from the
+    log reader thread when a CUDA / cuBLAS error is detected. Idempotent
+    — `_gpu_broken[name]` stays True so future `start_*` calls also
+    coerce CPU mode for the rest of the session."""
+    m = _services.get(name)
+    if m is None or m.config is None:
+        return
+    new_cfg = m.config
+    try:
+        # Mutate in place so future restart_* calls keep CPU mode.
+        new_cfg.device = "cpu"  # type: ignore[union-attr]
+    except Exception:
+        pass
+    log.info("[%s] restarting on CPU due to GPU failure", name)
+    try:
+        asyncio.run(restart_service(name, new_cfg))
+    except Exception as exc:
+        log.error("[%s] CPU restart failed: %s", name, exc)
 
 
 # ── Lifecycle ────────────────────────────────────────────────────────
@@ -322,7 +425,21 @@ def _watch_exit(m: _Managed) -> None:
                      name=f"voxtype-{m.name}-restart").start()
 
 
+def _coerce_cpu_if_broken(name: ServiceName, cfg) -> None:
+    """If a previous launch saw CUDA/cuBLAS load errors, force device='cpu'
+    on this config so the service can actually serve requests."""
+    if not _gpu_broken.get(name):
+        return
+    if getattr(cfg, "device", None) == "gpu":
+        log.info("[%s] coercing device → cpu (previous GPU failure)", name)
+        try:
+            cfg.device = "cpu"
+        except Exception:
+            pass
+
+
 async def start_whisper(cfg: WhisperConfig) -> None:
+    _coerce_cpu_if_broken("whisper", cfg)
     with _lock:
         m = _services.setdefault("whisper", _Managed(name="whisper"))
     if m.proc and m.proc.poll() is None:
@@ -333,6 +450,7 @@ async def start_whisper(cfg: WhisperConfig) -> None:
 
 
 async def start_kokoro(cfg: KokoroConfig) -> None:
+    _coerce_cpu_if_broken("kokoro", cfg)
     with _lock:
         m = _services.setdefault("kokoro", _Managed(name="kokoro"))
     if m.proc and m.proc.poll() is None:

@@ -606,7 +606,11 @@ def _build_logs(window) -> QWidget:
         ACCENT, WARN, ERR, OK, FG_DIM, FG_MUTE, BG_ELEV,
     )
 
-    LOG_FILES = ["voxtype.log", "voxtype.log.prev"]
+    LOG_FILES = [
+        "voxtype.log", "voxtype.log.prev",
+        "whisper.log", "whisper.log.prev",
+        "kokoro.log",  "kokoro.log.prev",
+    ]
     MAX_TAIL_BYTES = 512 * 1024
 
     class LogHighlighter(QSyntaxHighlighter):

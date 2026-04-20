@@ -189,8 +189,12 @@ class Orchestrator(QObject):
         try:
             raw = await stt.transcribe(pcm, f"http://127.0.0.1:{s.whisper_port}")
             log.info("STT: %r", (raw[:120] + "…") if len(raw) > 120 else raw)
+        except asyncio.TimeoutError:
+            log.error("STT timed out — server unresponsive (check whisper.log)")
+            self._flash_error("Whisper hung")
+            return
         except Exception as exc:
-            log.error("STT failed: %s", exc)
+            log.error("STT failed: %s: %s", type(exc).__name__, exc)
             self._flash_error("STT failed")
             return
 
