@@ -122,8 +122,8 @@ if (-not (Test-Path $voxPython)) {
 }
 
 Write-Host "    pip install (PySide6, pynput, sounddevice, numpy, Pillow, mss, aiohttp)..." -ForegroundColor DarkGray
-& $voxPython -m pip install --upgrade pip --quiet 2>&1 | Out-Null
-& "$voxVenv\Scripts\pip.exe" install -r "$voxTypeDir\requirements.txt" --quiet 2>&1 | Out-Null
+& $voxPython -m pip install --upgrade pip --no-cache-dir --quiet 2>&1 | Out-Null
+& "$voxVenv\Scripts\pip.exe" install -r "$voxTypeDir\requirements.txt" --no-cache-dir --quiet 2>&1 | Out-Null
 
 if (-not (Test-Path "$voxVenv\Lib\site-packages\PySide6")) { Fail "VoxType UI pip install failed" }
 Ok "VoxType UI deps installed"
@@ -140,8 +140,23 @@ if (-not (Test-Path "$sttVenv\Scripts\python.exe")) {
 }
 
 Write-Host "    pip install (skips download if up-to-date)..." -ForegroundColor DarkGray
-& "$sttVenv\Scripts\python.exe" -m pip install --upgrade pip --quiet 2>&1 | Out-Null
-& "$sttVenv\Scripts\pip.exe" install faster-whisper-server --quiet 2>&1 | Out-Null
+& "$sttVenv\Scripts\python.exe" -m pip install --upgrade pip --no-cache-dir --quiet 2>&1 | Out-Null
+& "$sttVenv\Scripts\pip.exe" install faster-whisper-server --no-cache-dir --quiet 2>&1 | Out-Null
+
+# CTranslate2 4.x (what faster-whisper ships with) needs CUDA 12 runtime -
+# specifically cublas64_12.dll + cudnn_ops_*.dll. The NVIDIA pip wheels drop
+# those DLLs straight into the venv's site-packages and CT2's DLL loader
+# finds them there automatically, so no system-wide CUDA install is
+# required. Skipped on CPU-only setups.
+if ($GpuSupport) {
+    Write-Host "    pip install (nvidia-cublas-cu12, nvidia-cudnn-cu12 - CUDA 12 runtime for Whisper GPU)..." -ForegroundColor DarkGray
+    & "$sttVenv\Scripts\pip.exe" install "nvidia-cublas-cu12" "nvidia-cudnn-cu12" --no-cache-dir --quiet 2>&1 | Out-Null
+    if (-not (Test-Path "$sttVenv\Lib\site-packages\nvidia\cublas")) {
+        Warn "nvidia-cublas-cu12 install may have failed - Whisper will auto-fall-back to CPU"
+    } else {
+        Ok "CUDA 12 runtime DLLs installed into stt-venv"
+    }
+}
 
 # Patch faster-whisper-server's tomllib lookup (PyPI packaging quirk).
 if (Test-Path $apiFile) {
@@ -184,17 +199,17 @@ if (-not $SkipKokoro) {
         & $pythonExe -m venv $ttsVenv
     }
 
-    Write-Host "    pip install (skips download if up-to-date — first run is multi-GB)..." -ForegroundColor DarkGray
-    & "$ttsVenv\Scripts\python.exe" -m pip install --upgrade pip --quiet 2>&1 | Out-Null
+    Write-Host "    pip install (skips download if up-to-date - first run is multi-GB)..." -ForegroundColor DarkGray
+    & "$ttsVenv\Scripts\python.exe" -m pip install --upgrade pip --no-cache-dir --quiet 2>&1 | Out-Null
 
     if ($GpuSupport) {
-        & "$ttsVenv\Scripts\pip.exe" install torch --index-url https://download.pytorch.org/whl/cu129 --quiet 2>&1 | Out-Null
+        & "$ttsVenv\Scripts\pip.exe" install torch --index-url https://download.pytorch.org/whl/cu129 --no-cache-dir --quiet 2>&1 | Out-Null
     } else {
-        & "$ttsVenv\Scripts\pip.exe" install torch --index-url https://download.pytorch.org/whl/cpu --quiet 2>&1 | Out-Null
+        & "$ttsVenv\Scripts\pip.exe" install torch --index-url https://download.pytorch.org/whl/cpu --no-cache-dir --quiet 2>&1 | Out-Null
     }
 
     Push-Location $kokoroDir
-    & "$ttsVenv\Scripts\pip.exe" install -e . --quiet 2>&1 | Out-Null
+    & "$ttsVenv\Scripts\pip.exe" install -e . --no-cache-dir --quiet 2>&1 | Out-Null
     Pop-Location
 
     if (-not (Test-Path $uvicornExe)) { Fail "Kokoro install failed" }
@@ -205,7 +220,7 @@ if (-not $SkipKokoro) {
             --output "$kokoroDir\api\src\models\v1_0" 2>&1 | Out-Null
         if (-not (Test-Path $modelPath)) { Fail "Failed to download Kokoro model" }
     }
-    Ok "Kokoro ready (off by default — enable from VoxType tray)"
+    Ok "Kokoro ready (off by default - enable from VoxType tray)"
 } else {
     Warn "Skipping Kokoro install (per -SkipKokoro)"
 }
