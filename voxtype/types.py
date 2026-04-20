@@ -36,6 +36,8 @@ class AppSettings:
     # ── Pill UI position (-1 = unset → center-bottom) ────────────────
     pill_x: int = -1
     pill_y: int = -1
+    pill_hidden: bool = False  # tray "Hide Pill" toggle — persisted so
+                                # the choice survives restart
 
     # ── Whisper STT (child process) ──────────────────────────────────
     whisper_enabled: bool = True

@@ -95,7 +95,11 @@ class Tray:
         reset_pos = QAction("Reset Position", self._pill_menu)
         reset_pos.triggered.connect(lambda: self._on_pill_reset and self._on_pill_reset())
         self._pill_menu.addAction(reset_pos)
-        self._pill_is_hidden = False
+        # Seed from settings so a restart remembers the last hide/show.
+        self._pill_is_hidden = bool(config.load().pill_hidden)
+        self._pill_hide_show.setText("Show Pill" if self._pill_is_hidden else "Hide Pill")
+        if self._pill_is_hidden and self._on_pill_hide:
+            self._on_pill_hide()
 
         self.menu.addSeparator()
 
@@ -149,6 +153,7 @@ class Tray:
                 self._on_pill_hide()
             self._pill_is_hidden = True
             self._pill_hide_show.setText("Show Pill")
+        config.patch("pill_hidden", self._pill_is_hidden)
 
     def _refresh(self) -> None:
         settings = config.load()

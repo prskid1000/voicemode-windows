@@ -37,7 +37,11 @@ def type_text(text: str, append: bool = False) -> None:
     the existing line content.
     """
     if not text.strip():
+        log.info("type_text: empty after strip — skipping")
         return
+    preview = text if len(text) <= 80 else text[:77] + "..."
+    log.info("type_text: pasting %d chars (append=%s): %r",
+             len(text), append, preview)
     content = (" " + text) if append else text
     fd, path = tempfile.mkstemp(prefix="voxtype-", suffix=".txt")
     try:
@@ -50,19 +54,32 @@ def type_text(text: str, append: bool = False) -> None:
                 "Start-Sleep -Milliseconds 30\n"
             )
         ps = _PS_TEMPLATE.format(path=path.replace("\\", "\\\\"), move_to_end=move_to_end)
+        t0 = time.monotonic()
         try:
-            subprocess.run(
+            result = subprocess.run(
                 ["powershell.exe", "-NoProfile", "-NonInteractive", "-Command", ps],
                 capture_output=True, timeout=5.0, check=False,
                 creationflags=subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0,
             )
+            dur = time.monotonic() - t0
+            if result.returncode != 0:
+                log.error(
+                    "type_text: PowerShell exited %d after %.2fs — stderr: %s",
+                    result.returncode, dur,
+                    result.stderr.decode("utf-8", errors="replace")[:500],
+                )
+                return
+            stderr = result.stderr.decode("utf-8", errors="replace").strip()
+            if stderr:
+                log.warning("type_text: PowerShell stderr: %s", stderr[:500])
+            log.info("type_text: paste sent in %.2fs", dur)
         except subprocess.TimeoutExpired as exc:
             log.warning("type_text timed out: %s", exc)
     finally:
         # Give the target app a moment to read the clipboard before we
         # remove the temp file; delete never fails silently in the
         # background.
-        time.sleep(0.01)
+        time.sleep(0.05)
         try:
             os.unlink(path)
         except OSError:
