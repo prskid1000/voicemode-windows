@@ -241,17 +241,11 @@ async def enhance(
     proxy_url: str,
     model: str,
     screenshot_jpeg_b64: str | None = None,
-    max_retries: int = 0,
-    timeout: float = 12.0,
+    max_retries: int = 2,
+    timeout: float = 30.0,
 ) -> str:
     """Clean `transcript` via the telecode proxy. Returns the cleaned
-    string, or the original on any failure.
-
-    Fail fast: for dictation cleanup a 12 s ceiling is plenty and
-    there's no point retrying a model that's already serialising
-    requests behind a stuck one. Raw transcript pastes within ~13 s of
-    the hotkey if the proxy is unresponsive, instead of the previous
-    ~90 s (30 s × 3 retries)."""
+    string, or the original on any failure."""
     if not transcript.strip():
         return ""
 
@@ -317,14 +311,10 @@ async def enhance(
                     return result
             except Exception as exc:
                 last_exc = exc
-                # str(asyncio.TimeoutError) is empty — include the class name
-                # so the log line is useful instead of ending in a bare colon.
-                log.info("LLM call failed (attempt %d): %s: %s",
-                         attempt + 1, type(exc).__name__, exc)
+                log.info("LLM call failed (attempt %d): %s", attempt + 1, exc)
 
-    last_desc = f"{type(last_exc).__name__}: {last_exc}" if last_exc else "unknown"
-    _record_failure(last_desc)
-    log.info("all retries failed, returning original. last error: %s", last_desc)
+    _record_failure(str(last_exc) if last_exc else "unknown")
+    log.info("all retries failed, returning original. last error: %s", last_exc)
     return transcript
 
 
