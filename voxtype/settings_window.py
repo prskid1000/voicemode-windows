@@ -44,12 +44,8 @@ def _page() -> tuple[QScrollArea, QWidget, QVBoxLayout]:
     scroll = QScrollArea()
     scroll.setWidgetResizable(True)
     scroll.setFrameShape(QFrame.Shape.NoFrame)
-    # Always show both scrollbars. AsNeeded was unreliable — the
-    # QScrollArea's widget-resizable mode stretches content to viewport
-    # horizontally, so h-scroll never appeared even when content had
-    # wide children. AlwaysOn makes their presence obvious and consistent.
-    scroll.setVerticalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOn)
-    scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOn)
+    scroll.setVerticalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAsNeeded)
+    scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAsNeeded)
     content = QWidget()
     content.setObjectName("content")
     layout = QVBoxLayout(content)
@@ -671,11 +667,23 @@ def _build_logs(window) -> QWidget:
     viewer = QPlainTextEdit()
     viewer.setReadOnly(True)
     viewer.setLineWrapMode(QPlainTextEdit.LineWrapMode.NoWrap)
+    # Scrollbar QSS inlined here because Qt's cascade stops descending
+    # into a widget that sets its own stylesheet — the global QScrollBar
+    # rule wouldn't reach this viewer's child scrollbars otherwise,
+    # leaving them invisible (0-width, transparent handle).
     viewer.setStyleSheet(
         f"QPlainTextEdit {{ background: {BG_ELEV}; border: 1px solid {BORDER};"
         f" border-radius: 6px; font-family: 'JetBrains Mono', Consolas, monospace;"
         f" font-size: 11.5px; padding: 6px 8px; selection-background-color: {ACCENT};"
         f" selection-color: #000; }}"
+        f"QScrollBar:vertical {{ background: #151b28; width: 14px; margin: 2px 0; border: none; }}"
+        f"QScrollBar::handle:vertical {{ background: #4a5a82; border-radius: 5px; min-height: 28px; }}"
+        f"QScrollBar::handle:vertical:hover {{ background: #6b82b8; }}"
+        f"QScrollBar:horizontal {{ background: #151b28; height: 14px; margin: 0 2px; border: none; }}"
+        f"QScrollBar::handle:horizontal {{ background: #4a5a82; border-radius: 5px; min-width: 28px; }}"
+        f"QScrollBar::handle:horizontal:hover {{ background: #6b82b8; }}"
+        f"QScrollBar::add-line, QScrollBar::sub-line {{ width: 0; height: 0; }}"
+        f"QScrollBar::add-page, QScrollBar::sub-page {{ background: transparent; }}"
     )
     viewer.setMinimumHeight(440)
     highlighter = LogHighlighter(viewer.document())
