@@ -173,15 +173,16 @@ class PillWindow(QWidget):
             rx = (W - rw) // 2
             ry = (H - rh) // 2
 
-        bg = QColor(_BG.get(state, _BG["idle"]))
-        border = _BORDER.get(state, _BORDER["idle"])
-        if state == "idle":
-            breathe = 0.85 + 0.15 * math.sin(self._phase / 25.0)
-            bg.setAlpha(int(bg.alpha() * breathe))
-        p.setBrush(QBrush(bg))
-        p.setPen(QPen(border, 1.0))
-        radius = rh / 2
-        p.drawRoundedRect(QRectF(rx, ry, rw, rh), radius, radius)
+        # Idle: pure transparent background — just the breathing dots.
+        # The shell (bg fill + border) is only drawn for active states so
+        # the pill doesn't show a persistent grey box on the desktop.
+        if state != "idle":
+            bg = QColor(_BG.get(state, _BG["idle"]))
+            border = _BORDER.get(state, _BORDER["idle"])
+            p.setBrush(QBrush(bg))
+            p.setPen(QPen(border, 1.0))
+            radius = rh / 2
+            p.drawRoundedRect(QRectF(rx, ry, rw, rh), radius, radius)
 
         cx = rx + rw / 2.0
         cy = ry + rh / 2.0
