@@ -261,15 +261,31 @@ async def _ping_once(url: str, timeout: float = 1.5) -> bool:
 
 
 async def _wait_ready(name: ServiceName, url: str,
-                      total_timeout: float = 60.0) -> bool:
+                      total_timeout: float = 600.0) -> bool:
+    """Poll /health until the service answers or we hit total_timeout.
+
+    Default is 10 minutes because faster-whisper-server downloads the
+    model BEFORE starting uvicorn — so `_ping_once` returns False
+    (connection refused) for the entire download. On a slow connection
+    downloading faster-whisper-small (~244 MB) can easily take 3-5
+    minutes. The previous 60s cap aborted mid-download and left
+    whisper in an inconsistent state.
+
+    A periodic log line confirms we're still waiting rather than dead."""
     start = time.monotonic()
     attempts = 0
+    next_heartbeat = 30.0
     while (time.monotonic() - start) < total_timeout:
         attempts += 1
         if await _ping_once(url):
             log.info("%s ready after %.1fs (%d attempts)",
                      name, time.monotonic() - start, attempts)
             return True
+        elapsed = time.monotonic() - start
+        if elapsed >= next_heartbeat:
+            log.info("%s still not ready after %.0fs — likely downloading / "
+                     "loading model (check %s.log)", name, elapsed, name)
+            next_heartbeat += 30.0
         await asyncio.sleep(0.5)
     log.warning("%s did not become ready in %.0fs", name, total_timeout)
     return False
