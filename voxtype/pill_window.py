@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import logging
 import math
+from typing import Callable
 
 from PySide6.QtCore import Qt, QTimer, QPoint, Signal, QSize, QRectF
 from PySide6.QtGui import (
@@ -30,7 +31,7 @@ from voxtype.types import PillState
 
 log = logging.getLogger("voxtype.pill")
 
-ORB_SIZE = 22
+ORB_SIZE = 28
 REC_W, REC_H = 56, 20
 
 # The widget resizes per-state so the translucent window bounds never
@@ -80,6 +81,10 @@ class PillWindow(QWidget):
         self._message: str = ""
         self._drag_pos: QPoint | None = None
         self._force_hidden = False
+        # Optional source of live audio levels (oldest → newest, each in
+        # [0, 1]). Wired by the orchestrator to Recorder.levels so the
+        # waveform reflects the actual mic instead of a sine wave.
+        self.level_provider: Callable[[], list[float]] | None = None
 
         self._phase = 0
         self._tick = QTimer(self)
@@ -204,10 +209,9 @@ class PillWindow(QWidget):
 
     def _draw_idle(self, p: QPainter, cx: float, cy: float) -> None:
         breathe = 0.80 + 0.20 * math.sin(self._phase / 25.0)
-        # Square black border hugging the widget bounds, with a small
-        # filled centre dot. Slightly rounded corners keep edges clean.
         stroke = 3.0
-        pen = QPen(QColor(0, 0, 0, 255), stroke)
+        border = QColor(120, 120, 120, 235)
+        pen = QPen(border, stroke)
         pen.setJoinStyle(Qt.PenJoinStyle.MiterJoin)
         p.setPen(pen)
         p.setBrush(Qt.BrushStyle.NoBrush)
@@ -217,13 +221,27 @@ class PillWindow(QWidget):
             6.0, 6.0,
         )
         p.setPen(Qt.PenStyle.NoPen)
-        core_r = 2.4 * breathe
-        p.setBrush(QBrush(QColor(0, 0, 0, 255)))
+        core_r = 3.0 * breathe
+        p.setBrush(QBrush(border))
         p.drawEllipse(QRectF(cx - core_r, cy - core_r, 2 * core_r, 2 * core_r))
 
     def _draw_recording(self, p: QPainter,
                          rx: float, ry: float, rw: float, rh: float) -> None:
-        pulse = 0.6 + 0.4 * math.sin(self._phase / 8.0)
+        bar_count = 11
+        levels: list[float] = []
+        if self.level_provider is not None:
+            try:
+                levels = self.level_provider()
+            except Exception:
+                levels = []
+
+        # Latest level drives the dot pulse; falls back to sine when no
+        # provider is wired (orchestrator-less smoke tests).
+        if levels:
+            pulse = 0.4 + 0.6 * levels[-1]
+        else:
+            pulse = 0.6 + 0.4 * math.sin(self._phase / 8.0)
+
         dot_r = 2.4
         dot_x = rx + 8
         dot_y = ry + rh / 2
@@ -233,56 +251,106 @@ class PillWindow(QWidget):
                               2 * (dot_r + 1.2), 2 * (dot_r + 1.2)))
         p.setBrush(QBrush(QColor(248, 113, 113)))
         p.drawEllipse(QRectF(dot_x - dot_r, dot_y - dot_r, 2 * dot_r, 2 * dot_r))
-        bar_count = 11
+
         bar_x = rx + 16
         for i in range(bar_count):
-            h = 2.0 + 6.0 * abs(math.sin((self._phase + i * 4) / 6.0))
-            alpha = int(90 + 140 * (h - 2.0) / 6.0)
+            if levels:
+                # Newest level on the right; pad with 0 if we don't have
+                # a full ring yet so bars grow in from the right edge.
+                idx = len(levels) - bar_count + i
+                lvl = levels[idx] if 0 <= idx < len(levels) else 0.0
+            else:
+                lvl = abs(math.sin((self._phase + i * 4) / 6.0))
+            h = 2.0 + 6.0 * lvl
+            alpha = int(90 + 140 * lvl)
             p.setBrush(QBrush(QColor(248, 113, 113, max(40, min(alpha, 235)))))
             p.drawRoundedRect(QRectF(bar_x + i * 3, ry + rh / 2 - h / 2, 1.6, h), 0.8, 0.8)
 
     def _draw_processing(self, p: QPainter, cx: float, cy: float) -> None:
-        pen = QPen(QColor(245, 158, 11), 1.6)
-        pen.setCapStyle(Qt.PenCapStyle.RoundCap)
-        p.setPen(pen)
-        p.setBrush(Qt.BrushStyle.NoBrush)
-        r = 5.0
-        start = (self._phase * 12) % 360
-        p.drawArc(QRectF(cx - r, cy - r, 2 * r, 2 * r),
-                  int(start * 16), int(110 * 16))
+        # Three amber dots orbiting the center; the lead dot is brightest
+        # and largest, the trailing two fade for a comet-trail feel.
+        p.setPen(Qt.PenStyle.NoPen)
+        orbit_r = 5.5
+        base = self._phase * 0.22
+        spec = ((1.9, 235), (1.5, 150), (1.1, 80))
+        for i, (size, alpha) in enumerate(spec):
+            a = base - i * 0.55
+            x = cx + orbit_r * math.cos(a)
+            y = cy + orbit_r * math.sin(a)
+            p.setBrush(QBrush(QColor(245, 158, 11, alpha)))
+            p.drawEllipse(QRectF(x - size, y - size, 2 * size, 2 * size))
 
     def _draw_enhancing(self, p: QPainter, cx: float, cy: float) -> None:
-        twinkle = 0.75 + 0.25 * math.sin(self._phase / 7.0)
+        # 4-point star that slowly rotates while pulsing — feels more
+        # "magical processing" than the static twinkle. Points rotated
+        # in-place to avoid juggling QPainter save/restore state.
+        twinkle = 0.78 + 0.22 * math.sin(self._phase / 6.5)
+        rot = math.radians(self._phase * 3.0)
+        cr, sr = math.cos(rot), math.sin(rot)
+        arm = 5.4 * twinkle
+        waist = 1.3
+        local = (
+            (0, -arm), (waist, -waist), (arm, 0), (waist, waist),
+            (0, arm), (-waist, waist), (-arm, 0), (-waist, -waist),
+        )
+        path = QPainterPath()
+        first = True
+        for x, y in local:
+            wx = cx + x * cr - y * sr
+            wy = cy + x * sr + y * cr
+            if first:
+                path.moveTo(wx, wy)
+                first = False
+            else:
+                path.lineTo(wx, wy)
+        path.closeSubpath()
         p.setPen(Qt.PenStyle.NoPen)
-        v = QPainterPath()
-        v.moveTo(cx,     cy - 5); v.lineTo(cx + 1, cy)
-        v.lineTo(cx,     cy + 5); v.lineTo(cx - 1, cy)
-        v.closeSubpath()
         p.setBrush(QBrush(QColor(167, 139, 250, int(230 * twinkle))))
-        p.drawPath(v)
-        h = QPainterPath()
-        h.moveTo(cx - 5, cy); h.lineTo(cx,     cy - 1)
-        h.lineTo(cx + 5, cy); h.lineTo(cx,     cy + 1)
-        h.closeSubpath()
-        p.setBrush(QBrush(QColor(129, 140, 248, int(178 * twinkle))))
-        p.drawPath(h)
-        p.setBrush(QBrush(QColor(196, 181, 253)))
-        p.drawEllipse(QRectF(cx - 0.8, cy - 0.8, 1.6, 1.6))
+        p.drawPath(path)
+        # Bright bead at the centre, breathing out of phase with the star.
+        bead_r = 1.0 + 0.6 * (1.0 - twinkle)
+        p.setBrush(QBrush(QColor(224, 215, 255, 235)))
+        p.drawEllipse(QRectF(cx - bead_r, cy - bead_r, 2 * bead_r, 2 * bead_r))
 
     def _draw_typing(self, p: QPainter, cx: float, cy: float) -> None:
-        pen = QPen(QColor(52, 211, 153), 1.8)
+        # Progressively-drawn check that loops: ~1.4s draw, ~0.4s hold,
+        # then restart. The pen drags along the two segments by length
+        # (not by raw t) so the speed feels uniform across the elbow.
+        loop_len = 22
+        progress = (self._phase % loop_len) / loop_len
+        draw_t = min(1.0, progress / 0.78)
+        pen = QPen(QColor(52, 211, 153), 1.9)
         pen.setCapStyle(Qt.PenCapStyle.RoundCap)
         pen.setJoinStyle(Qt.PenJoinStyle.RoundJoin)
         p.setPen(pen)
         p.setBrush(Qt.BrushStyle.NoBrush)
+        ax, ay = cx - 4.5, cy + 0.4
+        bx, by = cx - 1.0, cy + 3.2
+        ex, ey = cx + 4.5, cy - 3.2
+        seg1 = math.hypot(bx - ax, by - ay)
+        seg2 = math.hypot(ex - bx, ey - by)
+        target = draw_t * (seg1 + seg2)
         path = QPainterPath()
-        path.moveTo(cx - 4, cy + 0.3)
-        path.lineTo(cx - 1, cy + 3)
-        path.lineTo(cx + 4, cy - 3)
+        path.moveTo(ax, ay)
+        if target <= seg1:
+            t = target / seg1 if seg1 else 1.0
+            path.lineTo(ax + t * (bx - ax), ay + t * (by - ay))
+        else:
+            path.lineTo(bx, by)
+            t = (target - seg1) / seg2 if seg2 else 1.0
+            path.lineTo(bx + t * (ex - bx), by + t * (ey - by))
         p.drawPath(path)
 
     def _draw_error(self, p: QPainter, cx: float, cy: float) -> None:
-        jitter = 0.3 * math.sin(self._phase / 2.0)
+        # Pulsing halo behind a jittering bolt — reads as alarm without
+        # being noisy. Halo pulse uses |sin| so the ring fully fades in
+        # and out instead of just brightening.
+        pulse = abs(math.sin(self._phase / 4.5))
+        halo_r = 5.0 + 2.0 * pulse
+        p.setPen(Qt.PenStyle.NoPen)
+        p.setBrush(QBrush(QColor(248, 113, 113, int(70 * pulse))))
+        p.drawEllipse(QRectF(cx - halo_r, cy - halo_r, 2 * halo_r, 2 * halo_r))
+        jitter = 0.4 * math.sin(self._phase / 1.6)
         p.translate(jitter, 0)
         path = QPainterPath()
         path.moveTo(cx + 0.5, cy - 4.5); path.lineTo(cx - 2,   cy + 0.5)
@@ -290,7 +358,6 @@ class PillWindow(QWidget):
         path.lineTo(cx + 2,   cy - 0.5); path.lineTo(cx + 0.5, cy - 0.5)
         path.closeSubpath()
         p.setBrush(QBrush(QColor(248, 113, 113)))
-        p.setPen(Qt.PenStyle.NoPen)
         p.drawPath(path)
         p.translate(-jitter, 0)
 
@@ -318,5 +385,6 @@ class PillWindow(QWidget):
 
     def _on_tick(self) -> None:
         self._phase = (self._phase + 1) % 36000
-        if self._state in ("idle", "recording", "processing", "enhancing", "error"):
+        if self._state in ("idle", "recording", "processing",
+                           "enhancing", "typing", "error"):
             self.update()

@@ -12,6 +12,7 @@ own thread is never blocked.
 """
 from __future__ import annotations
 
+import collections
 import logging
 import threading
 import time
@@ -29,6 +30,13 @@ CHANNELS = 1
 # threshold as voxtype/vad.py.
 _SILENCE_RMS = 100.0
 
+# Reference RMS for normalising the live level meter to 0..1. Picked so
+# normal-conversation int16 RMS (~1500–4000) maps comfortably into the
+# visible bar range; loud speech saturates at 1.0.
+_LEVEL_REF = 4000.0
+# Number of recent per-callback RMS samples kept for the waveform.
+_LEVEL_RING = 11
+
 
 class Recorder:
     def __init__(self) -> None:
@@ -41,6 +49,11 @@ class Recorder:
         self._on_silence_cb: Callable[[], None] | None = None
         self._silence_start: float | None = None
         self._had_speech: bool = False
+
+        # Live audio-level ring for the recording-state waveform. Pushed
+        # from PortAudio's callback thread, read from the Qt thread.
+        self._levels: collections.deque[float] = collections.deque(maxlen=_LEVEL_RING)
+        self._levels_lock = threading.Lock()
 
     def start(self,
               silence_duration: float = 0.0,
@@ -62,6 +75,8 @@ class Recorder:
         self._on_silence_cb = on_silence
         self._silence_start = None
         self._had_speech = False
+        with self._levels_lock:
+            self._levels.clear()
         fired = {"done": False}
 
         def _callback(indata, frames, time_info, status):
@@ -71,11 +86,14 @@ class Recorder:
             with self._lock:
                 self._chunks.append(pcm)
 
+            samples = np.frombuffer(pcm, dtype=np.int16)
+            rms = float(np.sqrt(np.mean(samples.astype(np.float64) ** 2))) if samples.size else 0.0
+            with self._levels_lock:
+                self._levels.append(min(1.0, rms / _LEVEL_REF))
+
             if self._silence_duration <= 0 or self._on_silence_cb is None or fired["done"]:
                 return
 
-            samples = np.frombuffer(pcm, dtype=np.int16)
-            rms = float(np.sqrt(np.mean(samples.astype(np.float64) ** 2))) if samples.size else 0.0
             now = time.monotonic()
             if rms > _SILENCE_RMS:
                 self._had_speech = True
@@ -118,3 +136,12 @@ class Recorder:
     @property
     def recording(self) -> bool:
         return self._stream is not None
+
+    def levels(self) -> list[float]:
+        """Snapshot of recent normalised RMS levels (oldest → newest).
+
+        Each entry is one PortAudio callback's RMS divided by `_LEVEL_REF`,
+        clipped to [0, 1]. Safe to call from any thread; returns an empty
+        list before the first callback."""
+        with self._levels_lock:
+            return list(self._levels)

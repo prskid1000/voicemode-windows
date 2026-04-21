@@ -101,6 +101,7 @@ class Orchestrator(QObject):
         self.recorder = Recorder()
 
         self.pill = PillWindow()
+        self.pill.level_provider = self.recorder.levels
         self.pill_state_req.connect(self._apply_pill_state)
         self.flash_error_req.connect(self._apply_flash_error)
 
