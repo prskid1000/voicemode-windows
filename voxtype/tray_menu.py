@@ -39,6 +39,8 @@ class Tray:
                  on_toggle_window: Callable[[], None],
                  on_quit: Callable[[], None],
                  on_restart_service: Callable[[str], None],
+                 on_start_service: Callable[[str], None],
+                 on_stop_service: Callable[[str], None],
                  on_proxy_ping: Callable[[], None],
                  on_pill_reset: Callable[[], None] | None = None,
                  on_pill_hide:  Callable[[], None] | None = None,
@@ -46,6 +48,8 @@ class Tray:
         self._on_toggle_window = on_toggle_window
         self._on_quit = on_quit
         self._on_restart_service = on_restart_service
+        self._on_start_service = on_start_service
+        self._on_stop_service = on_stop_service
         self._on_proxy_ping = on_proxy_ping
         self._on_pill_reset = on_pill_reset
         self._on_pill_hide  = on_pill_hide
@@ -63,9 +67,15 @@ class Tray:
         self._whisper_status.setEnabled(False)
         self._whisper_menu.addAction(self._whisper_status)
         self._whisper_menu.addSeparator()
-        restart_w = QAction("Restart", self._whisper_menu)
-        restart_w.triggered.connect(lambda: on_restart_service("whisper"))
-        self._whisper_menu.addAction(restart_w)
+        self._whisper_start = QAction("Start", self._whisper_menu)
+        self._whisper_start.triggered.connect(lambda: on_start_service("whisper"))
+        self._whisper_menu.addAction(self._whisper_start)
+        self._whisper_stop = QAction("Stop", self._whisper_menu)
+        self._whisper_stop.triggered.connect(lambda: on_stop_service("whisper"))
+        self._whisper_menu.addAction(self._whisper_stop)
+        self._whisper_restart = QAction("Restart", self._whisper_menu)
+        self._whisper_restart.triggered.connect(lambda: on_restart_service("whisper"))
+        self._whisper_menu.addAction(self._whisper_restart)
 
         # ── Kokoro submenu ──────────────────────────────────────────
         self._kokoro_menu = self.menu.addMenu("⬡ Kokoro")
@@ -73,9 +83,15 @@ class Tray:
         self._kokoro_status.setEnabled(False)
         self._kokoro_menu.addAction(self._kokoro_status)
         self._kokoro_menu.addSeparator()
-        restart_k = QAction("Restart", self._kokoro_menu)
-        restart_k.triggered.connect(lambda: on_restart_service("kokoro"))
-        self._kokoro_menu.addAction(restart_k)
+        self._kokoro_start = QAction("Start", self._kokoro_menu)
+        self._kokoro_start.triggered.connect(lambda: on_start_service("kokoro"))
+        self._kokoro_menu.addAction(self._kokoro_start)
+        self._kokoro_stop = QAction("Stop", self._kokoro_menu)
+        self._kokoro_stop.triggered.connect(lambda: on_stop_service("kokoro"))
+        self._kokoro_menu.addAction(self._kokoro_stop)
+        self._kokoro_restart = QAction("Restart", self._kokoro_menu)
+        self._kokoro_restart.triggered.connect(lambda: on_restart_service("kokoro"))
+        self._kokoro_menu.addAction(self._kokoro_restart)
 
         # ── LLM submenu ─────────────────────────────────────────────
         self._llm_menu = self.menu.addMenu("⬡ LLM")
@@ -170,9 +186,15 @@ class Tray:
             else:
                 self._whisper_menu.setTitle("⬡ Whisper: Stopped")
                 self._whisper_status.setText(s.last_error or "not running")
+            self._whisper_start.setEnabled(not s.running)
+            self._whisper_stop.setEnabled(s.running)
+            self._whisper_restart.setEnabled(True)
         else:
             self._whisper_menu.setTitle("⬡ Whisper: Disabled")
             self._whisper_status.setText("disabled in settings")
+            self._whisper_start.setEnabled(False)
+            self._whisper_stop.setEnabled(False)
+            self._whisper_restart.setEnabled(False)
 
         # Kokoro
         if settings.kokoro_enabled:
@@ -186,9 +208,15 @@ class Tray:
             else:
                 self._kokoro_menu.setTitle("⬡ Kokoro: Stopped")
                 self._kokoro_status.setText(s.last_error or "not running")
+            self._kokoro_start.setEnabled(not s.running)
+            self._kokoro_stop.setEnabled(s.running)
+            self._kokoro_restart.setEnabled(True)
         else:
             self._kokoro_menu.setTitle("⬡ Kokoro: Disabled")
             self._kokoro_status.setText("disabled in settings")
+            self._kokoro_start.setEnabled(False)
+            self._kokoro_stop.setEnabled(False)
+            self._kokoro_restart.setEnabled(False)
 
         # LLM — hide the submenu entirely until a real request establishes
         # reachability. No point staring at "Unknown" forever; Test Proxy

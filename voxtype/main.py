@@ -115,6 +115,8 @@ class Orchestrator(QObject):
             on_toggle_window=self.window.toggle,
             on_quit=self.quit,
             on_restart_service=self._restart_service,
+            on_start_service=self._start_service,
+            on_stop_service=self._stop_service,
             on_proxy_ping=self._probe_proxy,
             on_pill_reset=self.pill.reset_position,
             on_pill_hide=self.pill.hide_for_session,
@@ -366,6 +368,20 @@ class Orchestrator(QObject):
         else:
             cfg = process.KokoroConfig(port=s.kokoro_port, device=s.kokoro_device)
         self._loop.submit(process.restart_service(name, cfg))
+
+    def _start_service(self, name: str) -> None:
+        s = config.load()
+        if name == "whisper":
+            self._loop.submit(process.start_whisper(process.WhisperConfig(
+                model=s.whisper_model, port=s.whisper_port, device=s.whisper_device,
+            )))
+        elif name == "kokoro":
+            self._loop.submit(process.start_kokoro(process.KokoroConfig(
+                port=s.kokoro_port, device=s.kokoro_device,
+            )))
+
+    def _stop_service(self, name: str) -> None:
+        self._loop.submit(process.stop_service(name))
 
     def _probe_proxy(self) -> None:
         async def _do():
