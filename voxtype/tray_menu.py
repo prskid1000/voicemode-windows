@@ -1,7 +1,7 @@
 """QSystemTrayIcon + right-click menu for VoxType.
 
 Submenus:
-  Whisper / Kokoro / LLM  — status line + restart action
+  STT / TTS / LLM         — status line + load/unload actions
   Open Settings Window    — default left-click
   Quit VoxType
 """
@@ -61,37 +61,37 @@ class Tray:
         self.menu = QMenu()
         self.menu.setStyleSheet(QSS)
 
-        # ── Whisper submenu ─────────────────────────────────────────
-        self._whisper_menu = self.menu.addMenu("⬡ Whisper")
-        self._whisper_status = QAction("Disabled", self._whisper_menu)
-        self._whisper_status.setEnabled(False)
-        self._whisper_menu.addAction(self._whisper_status)
-        self._whisper_menu.addSeparator()
-        self._whisper_start = QAction("Start", self._whisper_menu)
-        self._whisper_start.triggered.connect(lambda: on_start_service("whisper"))
-        self._whisper_menu.addAction(self._whisper_start)
-        self._whisper_stop = QAction("Stop", self._whisper_menu)
-        self._whisper_stop.triggered.connect(lambda: on_stop_service("whisper"))
-        self._whisper_menu.addAction(self._whisper_stop)
-        self._whisper_restart = QAction("Restart", self._whisper_menu)
-        self._whisper_restart.triggered.connect(lambda: on_restart_service("whisper"))
-        self._whisper_menu.addAction(self._whisper_restart)
+        # ── STT submenu ─────────────────────────────────────────────
+        self._stt_menu = self.menu.addMenu("⬡ STT")
+        self._stt_status = QAction("Disabled", self._stt_menu)
+        self._stt_status.setEnabled(False)
+        self._stt_menu.addAction(self._stt_status)
+        self._stt_menu.addSeparator()
+        self._stt_start = QAction("Load", self._stt_menu)
+        self._stt_start.triggered.connect(lambda: on_start_service("stt"))
+        self._stt_menu.addAction(self._stt_start)
+        self._stt_stop = QAction("Unload", self._stt_menu)
+        self._stt_stop.triggered.connect(lambda: on_stop_service("stt"))
+        self._stt_menu.addAction(self._stt_stop)
+        self._stt_restart = QAction("Reload", self._stt_menu)
+        self._stt_restart.triggered.connect(lambda: on_restart_service("stt"))
+        self._stt_menu.addAction(self._stt_restart)
 
-        # ── Kokoro submenu ──────────────────────────────────────────
-        self._kokoro_menu = self.menu.addMenu("⬡ Kokoro")
-        self._kokoro_status = QAction("Disabled", self._kokoro_menu)
-        self._kokoro_status.setEnabled(False)
-        self._kokoro_menu.addAction(self._kokoro_status)
-        self._kokoro_menu.addSeparator()
-        self._kokoro_start = QAction("Start", self._kokoro_menu)
-        self._kokoro_start.triggered.connect(lambda: on_start_service("kokoro"))
-        self._kokoro_menu.addAction(self._kokoro_start)
-        self._kokoro_stop = QAction("Stop", self._kokoro_menu)
-        self._kokoro_stop.triggered.connect(lambda: on_stop_service("kokoro"))
-        self._kokoro_menu.addAction(self._kokoro_stop)
-        self._kokoro_restart = QAction("Restart", self._kokoro_menu)
-        self._kokoro_restart.triggered.connect(lambda: on_restart_service("kokoro"))
-        self._kokoro_menu.addAction(self._kokoro_restart)
+        # ── TTS submenu ─────────────────────────────────────────────
+        self._tts_menu = self.menu.addMenu("⬡ TTS")
+        self._tts_status = QAction("Disabled", self._tts_menu)
+        self._tts_status.setEnabled(False)
+        self._tts_menu.addAction(self._tts_status)
+        self._tts_menu.addSeparator()
+        self._tts_start = QAction("Load", self._tts_menu)
+        self._tts_start.triggered.connect(lambda: on_start_service("tts"))
+        self._tts_menu.addAction(self._tts_start)
+        self._tts_stop = QAction("Unload", self._tts_menu)
+        self._tts_stop.triggered.connect(lambda: on_stop_service("tts"))
+        self._tts_menu.addAction(self._tts_stop)
+        self._tts_restart = QAction("Reload", self._tts_menu)
+        self._tts_restart.triggered.connect(lambda: on_restart_service("tts"))
+        self._tts_menu.addAction(self._tts_restart)
 
         # ── LLM submenu ─────────────────────────────────────────────
         self._llm_menu = self.menu.addMenu("⬡ LLM")
@@ -174,54 +174,55 @@ class Tray:
     def _refresh(self) -> None:
         settings = config.load()
 
-        # Whisper
-        if settings.whisper_enabled:
-            s = process.get_status("whisper")
-            if s.running and s.ready:
-                self._whisper_menu.setTitle(f"⬢ Whisper: Ready :{settings.whisper_port}")
-                self._whisper_status.setText(f"PID {s.pid} · port {settings.whisper_port}")
+        # STT
+        if settings.stt_enabled:
+            s = process.get_status("stt")
+            if s.ready:
+                self._stt_menu.setTitle("⬢ STT: Ready")
+                model_short = (settings.stt_model_path.split("\\")[-1].split("/")[-1]
+                                or "(no model)")
+                self._stt_status.setText(f"{model_short} · {settings.stt_device}")
             elif s.running:
-                self._whisper_menu.setTitle("⬡ Whisper: Starting")
-                self._whisper_status.setText("warming up…")
+                self._stt_menu.setTitle("⬡ STT: Loading")
+                self._stt_status.setText("warming up…")
             else:
-                self._whisper_menu.setTitle("⬡ Whisper: Stopped")
-                self._whisper_status.setText(s.last_error or "not running")
-            self._whisper_start.setEnabled(not s.running)
-            self._whisper_stop.setEnabled(s.running)
-            self._whisper_restart.setEnabled(True)
+                self._stt_menu.setTitle("⬡ STT: Unloaded")
+                self._stt_status.setText(s.last_error or "not loaded")
+            self._stt_start.setEnabled(not s.ready and bool(settings.stt_model_path))
+            self._stt_stop.setEnabled(s.ready)
+            self._stt_restart.setEnabled(bool(settings.stt_model_path))
         else:
-            self._whisper_menu.setTitle("⬡ Whisper: Disabled")
-            self._whisper_status.setText("disabled in settings")
-            self._whisper_start.setEnabled(False)
-            self._whisper_stop.setEnabled(False)
-            self._whisper_restart.setEnabled(False)
+            self._stt_menu.setTitle("⬡ STT: Disabled")
+            self._stt_status.setText("disabled in settings")
+            self._stt_start.setEnabled(False)
+            self._stt_stop.setEnabled(False)
+            self._stt_restart.setEnabled(False)
 
-        # Kokoro
-        if settings.kokoro_enabled:
-            s = process.get_status("kokoro")
-            if s.running and s.ready:
-                self._kokoro_menu.setTitle(f"⬢ Kokoro: Ready :{settings.kokoro_port}")
-                self._kokoro_status.setText(f"PID {s.pid} · port {settings.kokoro_port}")
+        # TTS
+        if settings.tts_enabled:
+            s = process.get_status("tts")
+            if s.ready:
+                self._tts_menu.setTitle("⬢ TTS: Ready")
+                model_name = (settings.tts_model_path.split("\\")[-1].split("/")[-1]
+                              or "(no model)")
+                self._tts_status.setText(f"{model_name} · {settings.tts_device}")
             elif s.running:
-                self._kokoro_menu.setTitle("⬡ Kokoro: Starting")
-                self._kokoro_status.setText("warming up…")
+                self._tts_menu.setTitle("⬡ TTS: Loading")
+                self._tts_status.setText("warming up…")
             else:
-                self._kokoro_menu.setTitle("⬡ Kokoro: Stopped")
-                self._kokoro_status.setText(s.last_error or "not running")
-            self._kokoro_start.setEnabled(not s.running)
-            self._kokoro_stop.setEnabled(s.running)
-            self._kokoro_restart.setEnabled(True)
+                self._tts_menu.setTitle("⬡ TTS: Unloaded")
+                self._tts_status.setText(s.last_error or "not loaded")
+            self._tts_start.setEnabled(not s.ready and bool(settings.tts_model_path))
+            self._tts_stop.setEnabled(s.ready)
+            self._tts_restart.setEnabled(bool(settings.tts_model_path))
         else:
-            self._kokoro_menu.setTitle("⬡ Kokoro: Disabled")
-            self._kokoro_status.setText("disabled in settings")
-            self._kokoro_start.setEnabled(False)
-            self._kokoro_stop.setEnabled(False)
-            self._kokoro_restart.setEnabled(False)
+            self._tts_menu.setTitle("⬡ TTS: Disabled")
+            self._tts_status.setText("disabled in settings")
+            self._tts_start.setEnabled(False)
+            self._tts_stop.setEnabled(False)
+            self._tts_restart.setEnabled(False)
 
-        # LLM — hide the submenu entirely until a real request establishes
-        # reachability. No point staring at "Unknown" forever; Test Proxy
-        # remains available inside the Settings window if the user wants
-        # an explicit probe.
+        # LLM — hide until a real request establishes reachability.
         from voxtype import llm as _llm
         status = _llm.get_status()
         if not status.last_checked:
@@ -235,23 +236,26 @@ class Tray:
                 self._llm_menu.setTitle("⬡ LLM: Unreachable")
                 self._llm_status.setText(f"no response from {settings.proxy_url}")
 
-        # Tray hover tooltip — a compact summary of what VoxType is doing
-        # right now so mousing over the icon actually tells you something.
+        # Tray hover tooltip
         bits: list[str] = [f"VoxType · hotkey {settings.hotkey.label}"]
-        if settings.whisper_enabled:
-            ws = process.get_status("whisper")
-            if ws.running and ws.ready:
-                bits.append(f"Whisper {settings.whisper_model} :{settings.whisper_port}")
+        if settings.stt_enabled:
+            ws = process.get_status("stt")
+            if ws.ready:
+                model_short = (settings.stt_model_path.split("\\")[-1].split("/")[-1]
+                                or "(no model)")
+                bits.append(f"STT {model_short}")
             elif ws.running:
-                bits.append("Whisper starting…")
+                bits.append("STT loading…")
             else:
-                bits.append("Whisper stopped")
+                bits.append("STT unloaded")
         else:
-            bits.append("Whisper off")
+            bits.append("STT off")
         if status.last_checked:
             bits.append(f"LLM {'ok' if status.reachable else 'down'} · {settings.proxy_model}")
-        if settings.kokoro_enabled:
-            ks = process.get_status("kokoro")
-            if ks.running and ks.ready:
-                bits.append(f"Kokoro :{settings.kokoro_port}")
+        if settings.tts_enabled:
+            ts = process.get_status("tts")
+            if ts.ready:
+                bits.append(f"TTS ready")
+        if settings.server_enabled:
+            bits.append(f"HTTP :{settings.server_port}")
         self.tray.setToolTip("\n".join(bits))

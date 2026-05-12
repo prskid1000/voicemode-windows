@@ -3,31 +3,28 @@
 .SYNOPSIS
     VoxType Setup — local voice dictation overlay for Windows.
 .DESCRIPTION
-    Installs Whisper STT and Kokoro TTS as Python venvs inside the install
-    directory, installs the VoxType UI Python deps (PySide6 + pynput + …),
-    and registers a scheduled task `VoxType` that auto-starts at
-    logon. VoxType itself owns the Whisper and Kokoro child processes —
-    no separate scheduled tasks, no wrapper scripts.
+    Installs the VoxType UI Python deps (PySide6 + pynput + sherpa-onnx +
+    piper-tts + huggingface_hub + …) into a single venv, and registers a
+    scheduled task `VoxType` that auto-starts at logon. STT and TTS run
+    in-process via ONNX Runtime — no separate child processes, no extra
+    venvs.
 
-    The Electron UI has been replaced by a PySide6 UI that talks to
-    telecode's dual-protocol proxy for LLM transcript cleanup. No Node.js
-    is required any more.
+    External clients (telecode, MCP tools) reach VoxType through the
+    embedded OpenAI-compatible HTTP server on port 6600 (configurable).
+    LLM transcript cleanup is still routed through telecode's proxy.
 .PARAMETER InstallDir
-    Where everything lives. Defaults to ~/.voxtype (the repo dir
-    when this script is run from a clone).
-.PARAMETER WhisperModel
-    Initial Whisper model. VoxType can switch later from the tray.
+    Where everything lives. Defaults to ~/.voxtype.
 .PARAMETER GpuSupport
-    Install PyTorch with CUDA. Set to $false for CPU-only Kokoro.
-.PARAMETER SkipKokoro
-    Skip the Kokoro install (~3 GB of PyTorch + model). VoxType still works
-    for dictation; Kokoro is optional.
+    Swap CPU `onnxruntime` for `onnxruntime-gpu` so device='cuda' works
+    for STT and TTS. Set to $false for CPU-only.
+.PARAMETER SkipTTS
+    Skip the TTS install (piper-tts). Dictation still works; the TTS engine
+    just refuses to load.
 #>
 param(
     [string]$InstallDir   = "$env:USERPROFILE\.voxtype",
-    [string]$WhisperModel = "Systran/faster-whisper-small",
     [bool]  $GpuSupport   = $true,
-    [switch]$SkipKokoro
+    [switch]$SkipTTS
 )
 
 $ErrorActionPreference = "Stop"
@@ -106,9 +103,20 @@ Step "Install directory: $InstallDir"
 New-Item -ItemType Directory -Path $InstallDir -Force | Out-Null
 Ok "Ready"
 
-# ─── VoxType UI venv (PySide6 + sounddevice + pynput + …) ────────────
+# ─── Cleanup legacy sidecar venvs (idempotent) ───────────────────────
 
-Step "Installing VoxType UI"
+foreach ($legacy in @("stt-venv", "tts-venv", "Kokoro-FastAPI")) {
+    $p = Join-Path $InstallDir $legacy
+    if (Test-Path $p) {
+        Write-Host "    Removing legacy $legacy..." -ForegroundColor DarkGray
+        Remove-Item -Recurse -Force $p -ErrorAction SilentlyContinue
+        Ok "Removed legacy $legacy"
+    }
+}
+
+# ─── VoxType venv (single venv, all in-process via ONNX Runtime) ─────
+
+Step "Installing VoxType (single venv — UI + STT + TTS all in-process)"
 $voxVenv    = Join-Path $InstallDir "voxtype-venv"
 $voxPython  = Join-Path $voxVenv "Scripts\python.exe"
 $voxTypeDir = Join-Path $InstallDir "voxtype"
@@ -121,114 +129,37 @@ if (-not (Test-Path $voxPython)) {
     & $pythonExe -m venv $voxVenv
 }
 
-Write-Host "    pip install (PySide6, pynput, sounddevice, numpy, Pillow, mss, aiohttp)..." -ForegroundColor DarkGray
+Write-Host "    pip install core deps (PySide6, pynput, sounddevice, aiohttp, sherpa-onnx, piper-tts, huggingface_hub)..." -ForegroundColor DarkGray
 & $voxPython -m pip install --upgrade pip --no-cache-dir --quiet 2>&1 | Out-Null
 & "$voxVenv\Scripts\pip.exe" install -r "$voxTypeDir\requirements.txt" --no-cache-dir --quiet 2>&1 | Out-Null
 
 if (-not (Test-Path "$voxVenv\Lib\site-packages\PySide6")) { Fail "VoxType UI pip install failed" }
-Ok "VoxType UI deps installed"
+if (-not (Test-Path "$voxVenv\Lib\site-packages\sherpa_onnx")) { Fail "sherpa-onnx install failed" }
+Ok "Core deps installed (UI + STT engine)"
 
-# ─── Whisper STT venv ────────────────────────────────────────────────
-
-Step "Installing Whisper STT"
-$sttVenv    = Join-Path $InstallDir "stt-venv"
-$whisperExe = Join-Path $sttVenv "Scripts\faster-whisper-server.exe"
-$apiFile    = Join-Path $sttVenv "Lib\site-packages\faster_whisper_server\api.py"
-
-if (-not (Test-Path "$sttVenv\Scripts\python.exe")) {
-    & $pythonExe -m venv $sttVenv
-}
-
-Write-Host "    pip install (skips download if up-to-date)..." -ForegroundColor DarkGray
-& "$sttVenv\Scripts\python.exe" -m pip install --upgrade pip --no-cache-dir --quiet 2>&1 | Out-Null
-& "$sttVenv\Scripts\pip.exe" install faster-whisper-server --no-cache-dir --quiet 2>&1 | Out-Null
-
-# CTranslate2 4.x (what faster-whisper ships with) needs CUDA 12 runtime -
-# specifically cublas64_12.dll + cudnn_*64_9.dll. The NVIDIA pip wheels drop
-# those DLLs into stt-venv\Lib\site-packages\nvidia\*\bin. voxtype/process.py
-# prepends those bin dirs to the whisper child's PATH at spawn time so
-# LoadLibrary finds them (Windows' default DLL search does not). Skipped
-# on CPU-only setups.
-if ($GpuSupport) {
-    Write-Host "    pip install (nvidia-cublas-cu12, nvidia-cudnn-cu12 - CUDA 12 runtime for Whisper GPU)..." -ForegroundColor DarkGray
-    & "$sttVenv\Scripts\pip.exe" install "nvidia-cublas-cu12" "nvidia-cudnn-cu12" --no-cache-dir --quiet 2>&1 | Out-Null
-    $cublasDll = Join-Path $sttVenv "Lib\site-packages\nvidia\cublas\bin\cublas64_12.dll"
-    $cudnnDll  = Join-Path $sttVenv "Lib\site-packages\nvidia\cudnn\bin\cudnn64_9.dll"
-    $missing = @()
-    if (-not (Test-Path $cublasDll)) { $missing += "cublas64_12.dll" }
-    if (-not (Test-Path $cudnnDll))  { $missing += "cudnn64_9.dll" }
-    if ($missing.Count -gt 0) {
-        Warn ("CUDA runtime DLLs missing: {0} - Whisper will auto-fall-back to CPU" -f ($missing -join ", "))
-    } else {
-        Ok "CUDA 12 runtime DLLs present in stt-venv (cublas64_12.dll + cudnn64_9.dll)"
-    }
-}
-
-# Patch faster-whisper-server's tomllib lookup (PyPI packaging quirk).
-if (Test-Path $apiFile) {
-    $content = Get-Content $apiFile -Raw
-    if ($content -notmatch 'except FileNotFoundError') {
-        $patched = $content -replace `
-            '(with pyproject_path\.open\("rb"\) as f:\s+data = tomllib\.load\(f\)\s+return data\["project"\]\["version"\])', `
-@"
-try:
-        with pyproject_path.open("rb") as f:
-            data = tomllib.load(f)
-        return data["project"]["version"]
-    except FileNotFoundError:
-        return "0.0.2"
-"@
-        Set-Content $apiFile -Value $patched -NoNewline
-        Ok "Patched faster-whisper-server version lookup"
-    }
-}
-
-if (-not (Test-Path $whisperExe)) { Fail "Whisper install failed" }
-Ok "Whisper ready (model downloads to ~/.cache/huggingface on first dictation)"
-
-# ─── Kokoro TTS venv (optional) ──────────────────────────────────────
-
-if (-not $SkipKokoro) {
-    Step "Installing Kokoro TTS"
-    $kokoroDir  = Join-Path $InstallDir "Kokoro-FastAPI"
-    $ttsVenv    = Join-Path $InstallDir "tts-venv"
-    $uvicornExe = Join-Path $ttsVenv "Scripts\uvicorn.exe"
-    $modelPath  = Join-Path $kokoroDir "api\src\models\v1_0\kokoro-v1_0.pth"
-
-    if (-not (Test-Path "$kokoroDir\pyproject.toml")) {
-        if (Test-Path $kokoroDir) { Remove-Item -Recurse -Force $kokoroDir }
-        git clone --depth 1 https://github.com/remsky/Kokoro-FastAPI.git $kokoroDir 2>&1 | Out-Null
-        if (-not (Test-Path "$kokoroDir\pyproject.toml")) { Fail "Failed to clone Kokoro-FastAPI" }
-    }
-
-    if (-not (Test-Path "$ttsVenv\Scripts\python.exe")) {
-        & $pythonExe -m venv $ttsVenv
-    }
-
-    Write-Host "    pip install (skips download if up-to-date - first run is multi-GB)..." -ForegroundColor DarkGray
-    & "$ttsVenv\Scripts\python.exe" -m pip install --upgrade pip --no-cache-dir --quiet 2>&1 | Out-Null
-
-    if ($GpuSupport) {
-        & "$ttsVenv\Scripts\pip.exe" install torch --index-url https://download.pytorch.org/whl/cu129 --no-cache-dir --quiet 2>&1 | Out-Null
-    } else {
-        & "$ttsVenv\Scripts\pip.exe" install torch --index-url https://download.pytorch.org/whl/cpu --no-cache-dir --quiet 2>&1 | Out-Null
-    }
-
-    Push-Location $kokoroDir
-    & "$ttsVenv\Scripts\pip.exe" install -e . --no-cache-dir --quiet 2>&1 | Out-Null
-    Pop-Location
-
-    if (-not (Test-Path $uvicornExe)) { Fail "Kokoro install failed" }
-
-    if (-not (Test-Path $modelPath)) {
-        Write-Host "    Downloading Kokoro model (313 MB)..." -ForegroundColor DarkGray
-        & "$ttsVenv\Scripts\python.exe" "$kokoroDir\docker\scripts\download_model.py" `
-            --output "$kokoroDir\api\src\models\v1_0" 2>&1 | Out-Null
-        if (-not (Test-Path $modelPath)) { Fail "Failed to download Kokoro model" }
-    }
-    Ok "Kokoro ready (off by default - enable from VoxType tray)"
+if ($SkipTTS) {
+    Warn "Skipping TTS install (per -SkipTTS) — TTS engine will refuse to load"
 } else {
-    Warn "Skipping Kokoro install (per -SkipKokoro)"
+    if (-not (Test-Path "$voxVenv\Lib\site-packages\piper")) {
+        Warn "piper-tts didn't install — TTS engine will refuse to load until you `pip install piper-tts` manually"
+    } else {
+        Ok "TTS engine deps installed (piper-tts)"
+    }
+}
+
+# GPU: both STT (sherpa-onnx) and TTS (piper-tts) use ONNX Runtime under
+# the hood. The CPU `onnxruntime` wheel is pulled in transitively; swap
+# it for `onnxruntime-gpu` so device='cuda' actually lands on the GPU.
+# Falls back to CPU automatically if CUDA isn't usable.
+if ($GpuSupport) {
+    Write-Host "    pip install onnxruntime-gpu (replaces CPU onnxruntime for GPU inference)..." -ForegroundColor DarkGray
+    & "$voxVenv\Scripts\pip.exe" uninstall -y onnxruntime --quiet 2>&1 | Out-Null
+    & "$voxVenv\Scripts\pip.exe" install onnxruntime-gpu --no-cache-dir --quiet 2>&1 | Out-Null
+    if (Test-Path "$voxVenv\Lib\site-packages\onnxruntime") {
+        Ok "onnxruntime-gpu installed (STT + TTS will use CUDA when device='cuda')"
+    } else {
+        Warn "onnxruntime-gpu install failed — falling back to CPU inference"
+    }
 }
 
 # ─── Scheduled task ──────────────────────────────────────────────────
@@ -236,8 +167,8 @@ if (-not $SkipKokoro) {
 Step "Registering scheduled task: VoxType"
 
 # pythonw.exe is the no-console GUI binary (ships with every Python install)
-# so the task runs fully hidden. VoxType spawns Whisper/Kokoro as child
-# processes itself.
+# so the task runs fully hidden. STT + TTS now run in-process — no child
+# processes to launch.
 $pythonwExe = $voxPython -replace 'python\.exe$','pythonw.exe'
 if (-not (Test-Path $pythonwExe)) {
     Warn "pythonw.exe not found next to $voxPython — falling back to python.exe"
@@ -275,24 +206,17 @@ Register-ScheduledTask -TaskName $taskName -Action $action -Trigger $trigger `
     -Settings $settings -Principal $principal -Force | Out-Null
 Ok "Scheduled task registered (auto-start at logon)"
 
-# ─── Seed settings.json with chosen Whisper model ────────────────────
+# ─── Seed settings.json with defaults ────────────────────────────────
 
 $dataDir      = Join-Path $voxTypeDir "data"
 $settingsFile = Join-Path $dataDir    "settings.json"
 New-Item -ItemType Directory -Path $dataDir -Force | Out-Null
 if (-not (Test-Path $settingsFile)) {
     & $voxPython -c @"
-import json, os
-from pathlib import Path
-import sys
-sys.path.insert(0, r'$InstallDir')
 from voxtype.config import load, save
-s = load()
-s.whisper_model = r'$WhisperModel'
-save(s)
-print('seeded', Path(r'$settingsFile'))
+save(load())
 "@ 2>&1 | Out-Null
-    Ok "Seeded settings.json (whisper model = $WhisperModel)"
+    Ok "Seeded settings.json (set STT/TTS model paths from the settings window)"
 }
 
 # ─── Start now ───────────────────────────────────────────────────────
@@ -312,8 +236,16 @@ Write-Host @"
   VoxType is running. Look for the tray icon (bottom-right).
   Press Ctrl+Win to dictate into any app.
 
-  Whisper auto-starts with VoxType. Kokoro is OFF by default —
-  enable it from tray > Services > Kokoro if you want TTS.
+  STT and TTS run in-process via ONNX Runtime. Both are OFF until
+  you point them at a model in Settings > Services:
+    - STT model: HuggingFace repo ID (auto-downloads) or local
+      sherpa-onnx model directory.
+    - TTS model: HuggingFace repo ID or local .onnx file
+      (e.g. a Piper voice from rhasspy/piper-voices).
+
+  External clients reach VoxType via the embedded HTTP server on
+  http://127.0.0.1:6600 (OpenAI-compatible: /v1/audio/transcriptions
+  and /v1/audio/speech).
 
   LLM transcript cleanup is routed through telecode's proxy at
   http://127.0.0.1:1235. Make sure telecode is running for the

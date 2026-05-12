@@ -1,6 +1,9 @@
-"""Settings + UI state types. Single source of truth — ported from
-voxtype/src/shared/types.ts with LM Studio fields replaced by telecode
-proxy endpoints."""
+"""Settings + UI state types. Single source of truth.
+
+STT and TTS both run in-process via ONNX Runtime. An embedded HTTP
+server (single port, default 6600) exposes them to external clients
+via OpenAI-compatible endpoints — see voxtype/server.py.
+"""
 from __future__ import annotations
 
 from dataclasses import dataclass, field, asdict
@@ -8,7 +11,8 @@ from typing import Literal
 
 PillState = Literal["idle", "recording", "processing", "enhancing", "typing", "error"]
 HotkeyMode = Literal["hold", "toggle"]
-DeviceMode = Literal["gpu", "cpu"]
+# ONNX Runtime provider preference. Used by both STT and TTS.
+OnnxDevice = Literal["cpu", "cuda"]
 
 
 @dataclass
@@ -36,34 +40,40 @@ class AppSettings:
     # ── Pill UI position (-1 = unset → center-bottom) ────────────────
     pill_x: int = -1
     pill_y: int = -1
-    pill_hidden: bool = False  # tray "Hide Pill" toggle — persisted so
-                                # the choice survives restart
+    pill_hidden: bool = False
 
-    # ── Whisper STT (child process) ──────────────────────────────────
-    whisper_enabled: bool = True
-    whisper_auto_start: bool = True      # spawn at VoxType boot so the
-                                         # first hotkey doesn't wait 5 s
-                                         # for model load. Set False if
-                                         # you want cold-start on demand.
-    whisper_idle_unload_sec: int = 300   # 0 = never unload; otherwise
-                                         # stop the child after N seconds
-                                         # of no transcribe requests
-    whisper_port: int = 6600
-    whisper_model: str = "Systran/faster-whisper-small"
-    whisper_device: DeviceMode = "gpu"
+    # ── Embedded HTTP server (serves both STT + TTS) ─────────────────
+    # Default 6600 — external clients reach VoxType through this port
+    # via OpenAI-compatible routes.
+    server_enabled: bool = True
+    server_port: int = 6600
 
-    # ── Kokoro TTS (child process, off by default) ───────────────────
-    kokoro_enabled: bool = False
-    kokoro_auto_start: bool = False
-    kokoro_idle_unload_sec: int = 600
-    kokoro_port: int = 6500
-    kokoro_voice: str = "af_sky"
-    kokoro_device: DeviceMode = "gpu"
+    # ── STT (in-process via ONNX Runtime) ────────────────────────────
+    # `stt_model_path` points at the encoder `.onnx` file (decoder and
+    # tokens.txt are auto-located next to it). Any sherpa-onnx-compatible
+    # export works.
+    stt_enabled: bool = True
+    stt_auto_start: bool = True
+    stt_idle_unload_sec: int = 300
+    stt_model_path: str = ""
+    stt_device: OnnxDevice = "cpu"
+    stt_language: str = "en"
+
+    # ── TTS (in-process via ONNX Runtime) ────────────────────────────
+    # Off by default. The model_path points at an ONNX file (paired
+    # `.onnx.json` is auto-located). Voice selection IS the model file —
+    # no separate voice list.
+    tts_enabled: bool = False
+    tts_auto_start: bool = False
+    tts_idle_unload_sec: int = 600
+    tts_model_path: str = ""
+    tts_device: OnnxDevice = "cpu"
+    tts_speaker: int = 0               # speaker index for multi-speaker models
+    tts_length_scale: float = 1.0      # >1 = slower; OpenAI speed is its inverse
+    tts_noise_scale: float = 0.667
+    tts_noise_w: float = 0.8
 
     # ── LLM enhancement (via telecode proxy) ─────────────────────────
-    # telecode proxy accepts OpenAI-shape POST /v1/chat/completions and
-    # routes to whichever local model it supervises. VoxType no longer
-    # manages the model itself.
     enhance_enabled: bool = True
     screen_context: bool = True
     proxy_url: str = "http://127.0.0.1:1235"
@@ -74,8 +84,7 @@ class AppSettings:
 
     # ── Serialization helpers ────────────────────────────────────────
     def to_json(self) -> dict:
-        d = asdict(self)
-        return d
+        return asdict(self)
 
     @classmethod
     def from_json(cls, d: dict) -> "AppSettings":
@@ -96,9 +105,6 @@ class AppSettings:
         return settings
 
 
-def whisper_url(s: AppSettings) -> str:
-    return f"http://127.0.0.1:{s.whisper_port}"
-
-
-def kokoro_url(s: AppSettings) -> str:
-    return f"http://127.0.0.1:{s.kokoro_port}"
+def server_url(s: AppSettings) -> str:
+    """Base URL for the embedded STT/TTS server."""
+    return f"http://127.0.0.1:{s.server_port}"

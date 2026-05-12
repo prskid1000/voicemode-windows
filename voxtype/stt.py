@@ -1,17 +1,16 @@
-"""Whisper STT — multipart POST to faster-whisper-server.
+"""STT — thin shim around the in-process engine.
 
-We record raw 16 kHz mono int16 PCM via sounddevice, wrap in a WAV
-header, and upload to /v1/audio/transcriptions. The server accepts
-any audio mime — we declare audio/wav for correctness. Response is
-JSON ({'text': ...})."""
+`transcribe()` delegates to `stt_engine.STTEngine` which runs ONNX-based
+STT directly in our process.
+
+`pcm_to_wav()` is kept because the main pipeline still uses it for
+history clipping / debugging. Audio for STT itself goes straight to
+the engine as raw int16 PCM.
+"""
 from __future__ import annotations
 
-import io
 import logging
 import struct
-from typing import Optional
-
-import aiohttp
 
 log = logging.getLogger("voxtype.stt")
 
@@ -22,7 +21,10 @@ BYTES_PER_SAMPLE = 2  # int16
 
 def pcm_to_wav(pcm: bytes, sample_rate: int = SAMPLE_RATE,
                channels: int = CHANNELS) -> bytes:
-    """Wrap raw 16-bit PCM in a minimal WAV header."""
+    """Wrap raw 16-bit PCM in a minimal WAV header.
+
+    Still useful for diagnostics / save-history-as-wav workflows even
+    though the engine itself takes raw PCM."""
     data_size = len(pcm)
     byte_rate = sample_rate * channels * BYTES_PER_SAMPLE
     block_align = channels * BYTES_PER_SAMPLE
@@ -40,44 +42,29 @@ def pcm_to_wav(pcm: bytes, sample_rate: int = SAMPLE_RATE,
 
 
 def silent_wav() -> bytes:
-    """100 ms of silence. Used to preload the Whisper model."""
+    """100 ms of silence. Used to preload the STT model."""
     n = SAMPLE_RATE // 10
     return pcm_to_wav(b"\x00\x00" * n)
 
 
-async def transcribe(pcm: bytes, whisper_url: str,
-                     language: str = "en",
-                     timeout: float = 45.0) -> str:
-    """POST the audio to /v1/audio/transcriptions. Returns the text;
-    raises on non-200."""
-    wav = pcm_to_wav(pcm)
-    url = whisper_url.rstrip("/") + "/v1/audio/transcriptions"
+async def transcribe(pcm: bytes, *_legacy_args,
+                      language: str = "en",
+                      timeout: float = 45.0,
+                      **_legacy_kwargs) -> str:
+    """Transcribe `pcm` (raw 16 kHz mono int16) and return the text.
 
-    form = aiohttp.FormData()
-    form.add_field("file", wav, filename="audio.wav", content_type="audio/wav")
-    form.add_field("model", "whisper-1")
-    form.add_field("language", language)
-    form.add_field("response_format", "json")
-
-    async with aiohttp.ClientSession(
-        timeout=aiohttp.ClientTimeout(total=timeout),
-    ) as session:
-        async with session.post(url, data=form) as resp:
-            body = await resp.text()
-            if resp.status != 200:
-                raise RuntimeError(f"Whisper STT error {resp.status}: {body[:400]}")
-            # Server may return JSON {"text": "..."} or plain text
-            try:
-                import json
-                return str(json.loads(body).get("text", "")).strip()
-            except Exception:
-                return body.strip()
+    `*_legacy_args` / `**_legacy_kwargs` swallow any leftover positional
+    URLs / kwargs from older call sites.
+    """
+    from voxtype.stt_engine import get_engine
+    return await get_engine().transcribe(pcm, language=language)
 
 
-async def preload(whisper_url: str) -> None:
-    """Warm up the Whisper model. Swallows errors — preload is best-effort."""
+async def preload(*_legacy_args, **_legacy_kwargs) -> None:
+    """Warm up the STT model. Swallows errors — preload is best-effort."""
+    from voxtype.stt_engine import get_engine
     try:
-        await transcribe(b"\x00\x00" * (SAMPLE_RATE // 10), whisper_url)
-        log.info("whisper preloaded")
+        await get_engine().ensure_loaded()
+        log.info("stt preloaded")
     except Exception as exc:
-        log.info("whisper preload failed (non-fatal): %s", exc)
+        log.info("stt preload failed (non-fatal): %s", exc)

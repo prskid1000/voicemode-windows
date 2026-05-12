@@ -2,7 +2,7 @@
 
 Sidebar sections:
   Dictation  — hotkey mode/combo, auto-stop, append, VAD
-  Services   — Whisper + Kokoro enable/ports/models/device
+  Services   — Server + STT + TTS (enable / model / device per engine)
   LLM        — enhance toggle, screen_context, proxy URL + model
   History    — saved transcripts (raw + cleaned), copy-back, clear
 """
@@ -23,8 +23,6 @@ from PySide6.QtWidgets import (
 from voxtype import config
 from voxtype.qt_theme import QSS, BG, FG, FG_DIM, FG_MUTE, BORDER, BG_CARD
 from voxtype.types import AppSettings, HotkeyCombo
-from voxtype.whisper_model import WHISPER_MODELS
-from voxtype.kokoro_voice import FEATURED_VOICES
 
 log = logging.getLogger("voxtype.settings_window")
 
@@ -168,7 +166,7 @@ def _slider_float(path: str, lo: float, hi: float, step: float = 0.1,
 def _spin_idle(path: str, default_sec: int = 300) -> QWidget:
     """Auto-unload composite: [Enabled] + [N s spinbox].
 
-    Storage: the same int field (e.g. whisper_idle_unload_sec).
+    Storage: the same int field (e.g. stt_idle_unload_sec).
       0          → auto-unload disabled
       > 0        → auto-unload after N seconds
 
@@ -339,7 +337,7 @@ def _build_dictation(window) -> QWidget:
         "frame — a silent mic won't insta-stop."),
         _slider_float("silence_duration_sec", 0.5, 5.0, 0.1)))
     body.addWidget(_row(_label("VAD",
-        "Skip empty recordings — don't call Whisper if the buffer is pure silence."),
+        "Skip empty recordings — don't call STT if the buffer is pure silence."),
         _checkbox("vad_enabled", "Enabled")))
     body.addWidget(_row(_label("Append Mode",
         "Send {End} before paste so dictation lands at end-of-line."),
@@ -359,51 +357,185 @@ def _line_edit_static(text: str) -> QLineEdit:
     return le
 
 
+def _hf_check_button(line_edit: QLineEdit, status_lbl: QLabel) -> QPushButton:
+    """`Check` button that pings huggingface.co/api/models/<id> or, if
+    the entered value looks like a local path, just checks existence.
+    Mirrors the DocGraph reranker pattern in telecode."""
+    from voxtype.qt_theme import OK, ERR, WARN
+    btn = QPushButton("Check")
+    btn.setProperty("class", "ghost")
+    btn.setFixedWidth(58)
+
+    async def _do_check() -> None:
+        from pathlib import Path
+        import aiohttp
+        text = line_edit.text().strip()
+        if not text:
+            status_lbl.setText("(empty)")
+            status_lbl.setStyleSheet(f"color: {FG_MUTE}; font-size: 11px;")
+            return
+        # Local path? skip HF and just stat the file.
+        candidate = Path(text).expanduser()
+        if candidate.exists():
+            status_lbl.setText("✓ local")
+            status_lbl.setStyleSheet(f"color: {OK}; font-size: 11px;")
+            return
+        status_lbl.setText("checking…")
+        status_lbl.setStyleSheet(f"color: {FG_MUTE}; font-size: 11px;")
+        # HF API uses GET — HEAD returns 401 even for public repos.
+        url = f"https://huggingface.co/api/models/{text.strip('/')}"
+        headers = {"User-Agent": "voxtype/1.0", "Accept": "application/json"}
+        try:
+            async with aiohttp.ClientSession(headers=headers) as sess:
+                async with sess.get(url, timeout=aiohttp.ClientTimeout(total=8),
+                                     allow_redirects=True) as resp:
+                    if resp.status == 200:
+                        status_lbl.setText("✓ found")
+                        status_lbl.setStyleSheet(f"color: {OK}; font-size: 11px;")
+                    elif resp.status in (401, 403):
+                        status_lbl.setText("🔒 private")
+                        status_lbl.setStyleSheet(f"color: {WARN}; font-size: 11px;")
+                    elif resp.status == 404:
+                        status_lbl.setText("✗ not found")
+                        status_lbl.setStyleSheet(f"color: {ERR}; font-size: 11px;")
+                    else:
+                        status_lbl.setText(f"? {resp.status}")
+                        status_lbl.setStyleSheet(f"color: {WARN}; font-size: 11px;")
+        except Exception:
+            status_lbl.setText("error")
+            status_lbl.setStyleSheet(f"color: {ERR}; font-size: 11px;")
+
+    def _on_click() -> None:
+        try:
+            loop = asyncio.get_event_loop()
+            if loop.is_running():
+                asyncio.ensure_future(_do_check())
+            else:
+                asyncio.run(_do_check())
+        except RuntimeError:
+            asyncio.run(_do_check())
+
+    btn.clicked.connect(_on_click)
+    return btn
+
+
+def _model_row(path_field: str, placeholder: str = "") -> QWidget:
+    """Model path row: text field (HF repo OR local path) + Browse + Check + status pill.
+
+    Used by both STT and TTS — they share the same UX:
+      - Text accepts an HF repo ID (e.g. `csukuangfj/sherpa-onnx-whisper-small`)
+        or a local file/folder path.
+      - Browse opens a file dialog for picking an `.onnx` locally.
+      - Check verifies the value (file exists locally, or HF repo lookup).
+    """
+    from PySide6.QtWidgets import QFileDialog
+    w = QWidget()
+    h = QHBoxLayout(w); h.setContentsMargins(0, 0, 0, 0); h.setSpacing(6)
+    le = QLineEdit()
+    le.setText(str(getattr(config.load(), path_field, "")))
+    le.setPlaceholderText(placeholder)
+    le.editingFinished.connect(lambda: config.patch(path_field, le.text()))
+
+    browse = QPushButton("Browse…")
+    browse.setProperty("class", "ghost")
+    browse.setFixedWidth(82)
+
+    def _on_browse() -> None:
+        fn, _ = QFileDialog.getOpenFileName(
+            w, "Select ONNX model file", le.text() or "",
+            "ONNX models (*.onnx);;All files (*.*)",
+        )
+        if fn:
+            le.setText(fn)
+            config.patch(path_field, fn)
+
+    browse.clicked.connect(_on_browse)
+
+    status = QLabel("")
+    status.setMinimumWidth(86)
+    status.setStyleSheet(f"color: {FG_MUTE}; font-size: 11px;")
+    le.textChanged.connect(lambda _t: (status.setText(""), None)[1])
+    check = _hf_check_button(le, status)
+
+    h.addWidget(le, 1)
+    h.addWidget(browse)
+    h.addWidget(check)
+    h.addWidget(status)
+    return w
+
+
 def _build_services(window) -> QWidget:
     scroll, _, layout = _page()
 
-    w_card, w_body = _card("Whisper STT", "faster-whisper-server child process")
-    w_body.addWidget(_row(_label("Enabled"), _checkbox("whisper_enabled", "Run Whisper as a child process")))
-    w_body.addWidget(_row(_label("Auto-Start On Boot",
-        "If off (default), Whisper spawns on the first hotkey press. "
-        "Turn on only if the first-transcribe warmup delay matters."),
-        _checkbox("whisper_auto_start", "Enabled")))
-    w_body.addWidget(_row(_label("Idle Unload",
-        "Stop the Whisper child after N seconds of no transcribe "
-        "requests. 0 = never. Next hotkey spawns it again. Same pattern "
-        "as telecode's llamacpp.idle_unload_sec."),
-        _spin_idle("whisper_idle_unload_sec")))
-    w_body.addWidget(_row(_label("Port"), _spin("whisper_port", 1024, 65535)))
-    w_body.addWidget(_row(_label("Model"),
-        _combo("whisper_model", [(m, lab) for m, lab in WHISPER_MODELS])))
-    w_body.addWidget(_row(_label("Device"),
-        _combo("whisper_device", [("gpu", "GPU (CUDA)"), ("cpu", "CPU")])))
-    restart_whisper = QPushButton("Restart Whisper")
-    restart_whisper.setProperty("class", "ghost")
-    restart_whisper.clicked.connect(lambda: window.restart_service("whisper"))
-    w_body.addWidget(restart_whisper)
-    layout.addWidget(w_card)
+    # ── Server card ────────────────────────────────────────────────
+    srv_card, srv_body = _card("OpenAI HTTP Server",
+                                "Single port exposing /v1/audio/transcriptions + /v1/audio/speech")
+    srv_body.addWidget(_row(_label("Enabled",
+        "Embedded server. External clients (telecode, MCP tools) reach the "
+        "in-process engines through this. Turn off if you only use VoxType "
+        "for local dictation."),
+        _checkbox("server_enabled", "Run embedded server")))
+    srv_body.addWidget(_row(_label("Port"), _spin("server_port", 1024, 65535)))
+    layout.addWidget(srv_card)
 
-    k_card, k_body = _card("Kokoro TTS", "Optional. Off by default.")
-    k_body.addWidget(_row(_label("Enabled"), _checkbox("kokoro_enabled", "Run Kokoro as a child process")))
-    k_body.addWidget(_row(_label("Auto-Start On Boot",
-        "If off (default), Kokoro spawns on first TTS request. "
-        "Turn on if another tool will hit the port continuously."),
-        _checkbox("kokoro_auto_start", "Enabled")))
-    k_body.addWidget(_row(_label("Idle Unload",
-        "Stop the Kokoro child after N seconds of no speak requests. "
+    # ── STT card ───────────────────────────────────────────────────
+    s_card, s_body = _card("STT", "speech-to-text · in-process ONNX Runtime")
+    s_body.addWidget(_row(_label("Enabled"),
+        _checkbox("stt_enabled", "Run STT")))
+    s_body.addWidget(_row(_label("Auto-Start On Boot",
+        "If off (default), the model loads on the first hotkey press. "
+        "Turn on only if the first-transcribe warmup delay matters."),
+        _checkbox("stt_auto_start", "Enabled")))
+    s_body.addWidget(_row(_label("Idle Unload",
+        "Unload the STT model after N seconds of no transcribe "
+        "requests. 0 = never. Next request reloads it automatically."),
+        _spin_idle("stt_idle_unload_sec")))
+    s_body.addWidget(_row(_label("Model",
+        "HuggingFace repo ID (auto-downloaded) or local path to an ONNX "
+        "model directory. Any sherpa-onnx compatible export works."),
+        _model_row("stt_model_path",
+                    "csukuangfj/sherpa-onnx-whisper-small  (or C:\\path\\to\\model)")))
+    s_body.addWidget(_row(_label("Device",
+        "CUDA falls back to CPU automatically if onnxruntime-gpu isn't available."),
+        _combo("stt_device", [("cpu", "CPU"), ("cuda", "GPU (CUDA)")])))
+    s_body.addWidget(_row(_label("Language",
+        "ISO 639-1 code (en, de, ja, etc.). Leave 'en' for English."),
+        _line_edit("stt_language")))
+    restart_stt = QPushButton("Reload STT")
+    restart_stt.setProperty("class", "ghost")
+    restart_stt.clicked.connect(lambda: window.restart_service("stt"))
+    s_body.addWidget(restart_stt)
+    layout.addWidget(s_card)
+
+    # ── TTS card ───────────────────────────────────────────────────
+    t_card, t_body = _card("TTS", "text-to-speech · in-process ONNX Runtime")
+    t_body.addWidget(_row(_label("Enabled"),
+        _checkbox("tts_enabled", "Run TTS")))
+    t_body.addWidget(_row(_label("Auto-Start On Boot"),
+        _checkbox("tts_auto_start", "Enabled")))
+    t_body.addWidget(_row(_label("Idle Unload",
+        "Unload the TTS model after N seconds of no synthesise calls. "
         "0 = never."),
-        _spin_idle("kokoro_idle_unload_sec")))
-    k_body.addWidget(_row(_label("Port"), _spin("kokoro_port", 1024, 65535)))
-    k_body.addWidget(_row(_label("Voice"),
-        _combo("kokoro_voice", [(v, lab) for v, lab in FEATURED_VOICES])))
-    k_body.addWidget(_row(_label("Device"),
-        _combo("kokoro_device", [("gpu", "GPU (CUDA)"), ("cpu", "CPU")])))
-    restart_kokoro = QPushButton("Restart Kokoro")
-    restart_kokoro.setProperty("class", "ghost")
-    restart_kokoro.clicked.connect(lambda: window.restart_service("kokoro"))
-    k_body.addWidget(restart_kokoro)
-    layout.addWidget(k_card)
+        _spin_idle("tts_idle_unload_sec")))
+    t_body.addWidget(_row(_label("Model",
+        "HuggingFace repo ID (auto-downloaded) or local path to an ONNX "
+        "voice file. The `.onnx.json` config sibling is auto-located."),
+        _model_row("tts_model_path",
+                    "rhasspy/piper-voices  (or C:\\path\\to\\voice.onnx)")))
+    t_body.addWidget(_row(_label("Device",
+        "CUDA falls back to CPU automatically if onnxruntime-gpu isn't available."),
+        _combo("tts_device", [("cpu", "CPU"), ("cuda", "GPU (CUDA)")])))
+    t_body.addWidget(_row(_label("Speaker",
+        "Speaker index for multi-speaker models. 0 = default."),
+        _spin("tts_speaker", 0, 999)))
+    t_body.addWidget(_row(_label("Length Scale",
+        "Speech rate. >1.0 = slower. Most voices sound good at 1.0."),
+        _slider_float("tts_length_scale", 0.5, 2.0, 0.05, suffix="x")))
+    restart_tts = QPushButton("Reload TTS")
+    restart_tts.setProperty("class", "ghost")
+    restart_tts.clicked.connect(lambda: window.restart_service("tts"))
+    t_body.addWidget(restart_tts)
+    layout.addWidget(t_card)
 
     layout.addStretch(1)
     return scroll
@@ -485,7 +617,7 @@ def _build_history(window) -> QWidget:
     meta = QLabel("—")
     meta.setStyleSheet("color: #8a96aa; font-size: 11px;")
     rl.addWidget(meta)
-    raw_label = QLabel("Raw (Whisper)")
+    raw_label = QLabel("Raw (STT)")
     raw_label.setProperty("class", "section_header")
     rl.addWidget(raw_label)
     raw_view = QPlainTextEdit(); raw_view.setReadOnly(True); raw_view.setMaximumHeight(110)
@@ -502,7 +634,7 @@ def _build_history(window) -> QWidget:
     # target app is the right UX.
     btn_row = QHBoxLayout()
     copy_raw = QPushButton("📋 Raw");   copy_raw.setProperty("class", "ghost")
-    copy_raw.setToolTip("Copy raw Whisper transcript to clipboard")
+    copy_raw.setToolTip("Copy raw STT transcript to clipboard")
     copy_final = QPushButton("📋 Final"); copy_final.setProperty("class", "ghost")
     copy_final.setToolTip("Copy cleaned (LLM-enhanced) transcript to clipboard")
     btn_row.addWidget(copy_raw); btn_row.addWidget(copy_final); btn_row.addStretch(1)
@@ -610,8 +742,6 @@ def _build_logs(window) -> QWidget:
 
     LOG_FILES = [
         "voxtype.log", "voxtype.log.prev",
-        "whisper.log", "whisper.log.prev",
-        "kokoro.log",  "kokoro.log.prev",
     ]
     MAX_TAIL_BYTES = 512 * 1024
 

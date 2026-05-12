@@ -3,7 +3,7 @@
 Architecture:
   - Qt runs on the main thread (QApplication.exec blocks there).
   - A dedicated asyncio loop runs on a worker thread for HTTP /
-    subprocess tasks (Whisper upload, LLM enhance, service probes).
+    background tasks (STT inference, LLM enhance, service probes).
   - The hotkey listener runs on pynput's own thread.
 
 State transitions (PillState):
@@ -25,7 +25,7 @@ from typing import Optional
 from PySide6.QtCore import Qt, QObject, QTimer, Signal, Slot, QCoreApplication
 from PySide6.QtWidgets import QApplication
 
-from voxtype import config, debug_log, process, stt, llm
+from voxtype import config, debug_log, process, stt, llm, server, stt_engine, tts_engine
 from voxtype.audio import Recorder
 from voxtype.hotkey import HotkeyListener
 from voxtype.pill_window import PillWindow
@@ -84,9 +84,9 @@ class Orchestrator(QObject):
         self._loop = loop
         self._recording_since: float = 0.0
         # In-flight pipeline tracker. While this future is alive+unfinished
-        # we ignore new hotkey presses — neither Whisper nor llama.cpp
-        # handle mid-request cancellation reliably on our setup (Whisper's
-        # sync threadpool route can't be aborted at all, llama.cpp has
+        # we ignore new hotkey presses — neither the STT engine nor
+        # llama.cpp handle mid-request cancellation reliably on our setup
+        # (STT inference can't be aborted mid-stream, llama.cpp has
         # ~1 s poll latency). Simpler + cleaner: the user can't start a
         # new turn until the current one finishes or the timeouts fire.
         self._pipeline_future = None  # type: ignore[var-annotated]
@@ -133,11 +133,11 @@ class Orchestrator(QObject):
         self.hotkey.set_combo(s.hotkey)
         self.hotkey.start()
 
-        # Lazy startup: we spawn the Whisper/Kokoro child processes that
-        # VoxType owns, but we do NOT probe the LLM proxy or warm up any
-        # model. All health state is populated by real requests (first
-        # dictation → Whisper; enhance_enabled + first hotkey → LLM proxy).
-        self._loop.submit(self._boot_sidecars())
+        # Boot: configure in-process engines, start the embedded HTTP
+        # server. The engines lazy-load on first request unless
+        # auto_start is set. The LLM proxy is never probed — its health
+        # state is populated by real enhance() requests.
+        self._loop.submit(self._boot_engines())
 
     # ── Pipeline ─────────────────────────────────────────────────────
 
@@ -223,21 +223,21 @@ class Orchestrator(QObject):
     async def _pipeline_inner(self, pcm: bytes, s: AppSettings) -> None:
         t0 = time.monotonic()
         raw = ""
-        # Idle-unload may have stopped Whisper; (re)spawn if needed.
+        # Idle-unload may have stopped STT; (re)load if needed.
         try:
-            await self._ensure_whisper_running()
+            await self._ensure_stt_running()
         except Exception as exc:
-            log.error("Whisper spawn failed: %s", exc)
-            self._flash_error("Whisper failed to start")
+            log.error("STT load failed: %s", exc)
+            self._flash_error("STT failed to start")
             return
 
-        process.mark_used("whisper")
+        process.mark_used("stt")
         try:
-            raw = await stt.transcribe(pcm, f"http://127.0.0.1:{s.whisper_port}")
+            raw = await stt.transcribe(pcm, language=s.stt_language)
             log.info("STT: %r", (raw[:120] + "…") if len(raw) > 120 else raw)
         except asyncio.TimeoutError:
-            log.error("STT timed out — server unresponsive (check whisper.log)")
-            self._flash_error("Whisper hung")
+            log.error("STT timed out — engine unresponsive")
+            self._flash_error("STT hung")
             return
         except Exception as exc:
             log.error("STT failed: %s: %s", type(exc).__name__, exc)
@@ -302,46 +302,50 @@ class Orchestrator(QObject):
         await asyncio.sleep(0.4)
         self.pill_state_req.emit("idle", "")
 
-    # ── Services / proxy ─────────────────────────────────────────────
+    # ── Engines / proxy ──────────────────────────────────────────────
 
-    async def _boot_sidecars(self) -> None:
-        """Start the sidecar processes only if the user opted in AND
-        asked for them to be pre-started. With the new idle-unload knobs
-        we keep things cold by default; services come up on first use."""
+    async def _boot_engines(self) -> None:
+        """Configure the in-process engines and start the embedded HTTP
+        server. Engines lazy-load on first request unless the user has
+        opted into auto_start. Idle-unload is owned by each engine."""
         s = config.load()
-
-        # Register idle-unload thresholds even for services we haven't
-        # spawned yet — when they come up later, the watcher already knows
-        # their timeout.
-        process.set_idle_unload("whisper", s.whisper_idle_unload_sec)
-        process.set_idle_unload("kokoro",  s.kokoro_idle_unload_sec)
-        process.start_idle_watcher()
+        # Push current settings into both engines so they know how to
+        # build the model when ensure_loaded() fires (either now or on
+        # first request).
+        try:
+            await stt_engine.get_engine().configure(s)
+        except Exception as exc:
+            log.warning("stt configure failed: %s", exc)
+        try:
+            await tts_engine.get_engine().configure(s)
+        except Exception as exc:
+            log.warning("tts configure failed: %s", exc)
 
         tasks = []
-        if s.whisper_enabled and s.whisper_auto_start:
-            tasks.append(process.start_whisper(process.WhisperConfig(
-                model=s.whisper_model, port=s.whisper_port, device=s.whisper_device,
-            )))
-        if s.kokoro_enabled and s.kokoro_auto_start:
-            tasks.append(process.start_kokoro(process.KokoroConfig(
-                port=s.kokoro_port, device=s.kokoro_device,
-            )))
+        if s.stt_enabled and s.stt_auto_start:
+            tasks.append(stt_engine.get_engine().ensure_loaded())
+        if s.tts_enabled and s.tts_auto_start and s.tts_model_path:
+            tasks.append(tts_engine.get_engine().ensure_loaded())
         if tasks:
             await asyncio.gather(*tasks, return_exceptions=True)
-        # No warm-up call. The first real request populates the model
-        # cache; latency is paid once on first hotkey press, not on boot.
 
-    async def _ensure_whisper_running(self) -> None:
-        """Idempotent: spawn Whisper if it's not already running. Called
-        lazily from the pipeline when we're about to transcribe."""
+        # Always start the embedded OpenAI-compatible server unless
+        # explicitly disabled — that's how telecode + MCP tools reach us.
+        if s.server_enabled:
+            try:
+                await server.start(port=s.server_port)
+            except Exception as exc:
+                log.error("embedded server failed to start: %s", exc)
+
+    async def _ensure_stt_running(self) -> None:
+        """Idempotent: load STT if not already loaded. Called lazily
+        from the pipeline. The engine handles the model lifecycle."""
         s = config.load()
-        if not s.whisper_enabled:
+        if not s.stt_enabled:
             return
-        if process.is_running("whisper"):
-            return
-        await process.start_whisper(process.WhisperConfig(
-            model=s.whisper_model, port=s.whisper_port, device=s.whisper_device,
-        ))
+        eng = stt_engine.get_engine()
+        await eng.configure(s)
+        await eng.ensure_loaded()
 
     def _capture_hotkey(self, cb) -> None:
         """Called by Settings → Dictation → Rebind. Forwards to the
@@ -361,24 +365,14 @@ class Orchestrator(QObject):
 
     def _restart_service(self, name: str) -> None:
         s = config.load()
-        if name == "whisper":
-            cfg = process.WhisperConfig(
-                model=s.whisper_model, port=s.whisper_port, device=s.whisper_device,
-            )
-        else:
-            cfg = process.KokoroConfig(port=s.kokoro_port, device=s.kokoro_device)
-        self._loop.submit(process.restart_service(name, cfg))
+        self._loop.submit(process.restart_service(name, s))
 
     def _start_service(self, name: str) -> None:
         s = config.load()
-        if name == "whisper":
-            self._loop.submit(process.start_whisper(process.WhisperConfig(
-                model=s.whisper_model, port=s.whisper_port, device=s.whisper_device,
-            )))
-        elif name == "kokoro":
-            self._loop.submit(process.start_kokoro(process.KokoroConfig(
-                port=s.kokoro_port, device=s.kokoro_device,
-            )))
+        if name == "stt":
+            self._loop.submit(process.start_stt(s))
+        elif name == "tts":
+            self._loop.submit(process.start_tts(s))
 
     def _stop_service(self, name: str) -> None:
         self._loop.submit(process.stop_service(name))

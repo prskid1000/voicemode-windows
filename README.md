@@ -4,11 +4,18 @@ Local voice dictation overlay for Windows, written in **pure Python +
 PySide6**. Press a hotkey, speak, release — cleaned text appears at
 your cursor in any app. No cloud, no telemetry, no account.
 
+STT and TTS both run **in-process via ONNX Runtime** — no separate
+sidecar servers, no extra venvs. Point each engine at any compatible
+ONNX model (local path or HuggingFace repo ID — auto-downloaded on
+first load). An embedded aiohttp server exposes both on a single
+OpenAI-compatible HTTP port (default `:6600`) so external clients can
+call `/v1/audio/transcriptions` and `/v1/audio/speech`.
+
 Sibling project of [telecode](https://github.com/prskid1000/telecode).
 LLM transcript cleanup is routed through telecode's dual-protocol proxy
 at `http://127.0.0.1:1235`, so any model telecode serves (llama.cpp,
 Qwen-VL, etc.) becomes a dictation backend automatically. There is no
-direct LM Studio dependency any more.
+direct LM Studio dependency.
 
 ---
 
@@ -23,14 +30,17 @@ cd "$env:USERPROFILE\.voxtype"
 `setup.ps1` will:
 
 1. Verify **Python 3.10+**, **git**, **ffmpeg** (optional), GPU support
-2. Create `voxtype-venv/` and `pip install -r voxtype/requirements.txt`
-   (PySide6, pynput, sounddevice, numpy, Pillow, mss, aiohttp, …)
-3. Create `stt-venv/` and `pip install faster-whisper-server` (~390 MB)
-4. Unless `-SkipKokoro`, clone Kokoro-FastAPI, create `tts-venv/`,
-   install PyTorch + CUDA wheels (~5 GB), download the Kokoro model
+2. Remove any legacy sidecar venvs (`stt-venv/`, `tts-venv/`,
+   `Kokoro-FastAPI/`) from a previous install — idempotent migration
+3. Create `voxtype-venv/` and `pip install -r voxtype/requirements.txt`
+   (PySide6, pynput, sounddevice, aiohttp, **sherpa-onnx**, **piper-tts**,
+   **huggingface_hub**, …) into one venv
+4. If `-GpuSupport $true` (default): swap CPU `onnxruntime` for
+   `onnxruntime-gpu` so `device='cuda'` lands on the GPU for both STT
+   and TTS (falls back to CPU automatically if CUDA isn't usable)
 5. Register a single scheduled task `VoxType` that launches
    `pythonw.exe -m voxtype` at logon (no console window)
-6. Seed `voxtype/data/settings.json` with your chosen Whisper model
+6. Seed `voxtype/data/settings.json` with defaults
 7. Start VoxType immediately
 
 Look for the tray icon (bottom-right). Press **Ctrl+Win**, speak,
@@ -39,16 +49,35 @@ release.
 ### Setup options
 
 ```powershell
-.\setup.ps1                                           # full install
-.\setup.ps1 -SkipKokoro                               # no TTS — saves ~5 GB
-.\setup.ps1 -GpuSupport $false                        # CPU-only PyTorch
-.\setup.ps1 -WhisperModel "Systran/faster-whisper-medium"
-.\setup.ps1 -InstallDir "D:\voxtype"                  # custom location
+.\setup.ps1                            # full install (STT + TTS, GPU)
+.\setup.ps1 -SkipTTS                   # no TTS deps
+.\setup.ps1 -GpuSupport $false         # CPU-only ONNX Runtime
+.\setup.ps1 -InstallDir "D:\voxtype"   # custom location
 ```
 
-Re-running `setup.ps1` is idempotent: venvs, clones, and model
-downloads are skipped when the artifacts already exist. A re-run on a
-fully-installed machine takes ~10 s.
+Re-running `setup.ps1` is idempotent.
+
+### Picking models
+
+Both STT and TTS are **off until you point them at a model** (open
+Settings → Services). For each engine you can enter either a local
+path or a **HuggingFace repo ID** — repo IDs auto-download to the HF
+cache on first load.
+
+**STT examples:**
+- `csukuangfj/sherpa-onnx-whisper-tiny.en` — small + fast
+- `csukuangfj/sherpa-onnx-whisper-small` — better quality
+- `C:\models\my-whisper-export` — local directory containing
+  `encoder.onnx` + `decoder.onnx` + `tokens.txt`
+
+**TTS examples:**
+- Any voice from
+  [huggingface.co/rhasspy/piper-voices](https://huggingface.co/rhasspy/piper-voices)
+  — point at the `.onnx` file (the `.onnx.json` sibling is auto-located)
+- A local `.onnx` file you've downloaded
+
+The **Check** button next to each model field verifies the value —
+local stat for paths, HuggingFace API for repo IDs.
 
 ---
 
@@ -57,14 +86,14 @@ fully-installed machine takes ~10 s.
 | Dependency | Required for | Where to get it |
 |---|---|---|
 | **Windows 10/11** | Target OS | — |
-| **Python 3.10+** | Everything (VoxType UI, Whisper, Kokoro) | https://python.org |
-| **git** | Clone Kokoro-FastAPI | https://git-scm.com |
-| **ffmpeg** (optional) | Some audio codecs Whisper might receive | `winget install ffmpeg` |
-| **NVIDIA GPU + CUDA driver** | Strongly recommended for Kokoro; Whisper works on CPU | https://nvidia.com/drivers |
+| **Python 3.10+** | Everything | https://python.org |
+| **git** | Cloning the repo | https://git-scm.com |
+| **ffmpeg** (optional) | Non-WAV audio uploads to the embedded server | `winget install ffmpeg` |
+| **NVIDIA GPU + CUDA driver** | Optional — STT + TTS fall back to CPU | https://nvidia.com/drivers |
 | **telecode** (optional) | LLM transcript cleanup | https://github.com/prskid1000/telecode |
 
 Without telecode running, dictation still works — you just get raw
-Whisper transcripts (no filler-word cleanup, no punctuation fixes).
+STT transcripts (no filler-word cleanup, no punctuation fixes).
 Set `enhance_enabled = false` in settings to silence the "proxy
 unreachable" warnings.
 
@@ -81,8 +110,8 @@ Hotkey up
     → recorder.stop() → raw PCM buffer
     → VAD gate (RMS energy) — drop pure silence
     → pill = processing
-    → stt.transcribe() — multipart POST to faster-whisper-server
-                         /v1/audio/transcriptions
+    → stt.transcribe() — DIRECT call into stt_engine.STTEngine
+                         (no HTTP — that's only for external clients)
 
 if enhance_enabled:
     → pill = enhancing
@@ -100,23 +129,39 @@ if enhance_enabled:
 → pill = idle
 ```
 
-All state transitions cross thread boundaries via Qt signals:
+### Embedded HTTP server
+
+Lives in `voxtype/server.py`, starts on port 6600 (configurable). Routes:
+
+```
+POST /v1/audio/transcriptions  →  STT (multipart upload)
+POST /v1/audio/speech          →  TTS (JSON in, WAV out)
+GET  /v1/models                →  engine list
+GET  /health                   →  engine readiness snapshot
+```
+
+The hot path inside VoxType calls the engines directly — this server
+exists so external clients (telecode, MCP tools, any OpenAI-shape API
+consumer) can reach VoxType over standard HTTP.
+
+### Threading
 
 - **Main thread**: Qt event loop (tray, pill, settings window)
-- **Worker thread**: dedicated asyncio loop for HTTP + subprocess work
+- **Worker thread**: dedicated asyncio loop for HTTP server + inference
+- **Inference thread pools**: one single-thread executor per engine —
+  serialises model calls so we never OOM from concurrent inference
 - **Pynput thread**: raw keyboard input hook
 
-Quit uses an `os._exit(0)` watchdog (5 s) so stuck pipelines or sticky
-child processes can't prevent shutdown. Whisper and Kokoro are killed
-with `taskkill /T` first, then `/F` if needed.
+Quit uses an `os._exit(0)` watchdog (5 s). Engine models are
+deallocated and CUDA caches flushed in `process.stop_all()`.
 
 ---
 
 ## Tray menu
 
 ```
-⬡/⬢ Whisper ▸ status + port + Restart
-⬡/⬢ Kokoro  ▸ status + port + Restart
+⬡/⬢ STT     ▸ status + model + Load / Unload / Reload
+⬡/⬢ TTS     ▸ status + model + Load / Unload / Reload
 ⬡/⬢ LLM     ▸ proxy model + Test Proxy Connection
 ⬢   Pill    ▸ Hide Pill / Show Pill + Reset Position
 ─
@@ -125,27 +170,25 @@ Open Settings Window   (default left-click)
 Quit VoxType
 ```
 
-The Settings window (left-click tray, or Open Settings Window) is a
-frameless dark window with a sidebar:
+The Settings window has these sections:
 
-- **Dictation** — hotkey mode, live **Rebind** button (press 1–2 keys
-  to capture), auto-stop on silence with **duration slider** (0.5–5 s),
-  VAD, append mode, save history
-- **Services** — Whisper + Kokoro enable / port / model / device +
-  **Auto-Start On Boot** + **Auto-Unload** (checkbox-plus-spinbox:
-  unchecked = never unload; checked = stop after N s of no requests,
-  respawn on next use). Restart buttons.
+- **Dictation** — hotkey mode, live **Rebind** button, auto-stop on
+  silence, VAD, append mode, save history
+- **Services** — three cards:
+  - **OpenAI HTTP Server** — enable + port for the embedded server
+  - **STT** — enable, auto-start, idle unload, model (free text accepting
+    HF repo or local path + Browse + HF Check button), device, language,
+    Reload
+  - **TTS** — enable, auto-start, idle unload, model path (with Browse
+    file dialog), device, speaker, length scale, Reload
 - **LLM** — enhance on/off, screen context, proxy URL + model, Test
-  Proxy Connection. No background probing — health state updates on
-  real enhance() requests (or the Test button).
-- **History** — saved transcripts with 📋 Raw / 📋 Final copy icons.
-- **Logs** — live-tailing voxtype.log / voxtype.log.prev with level
-  coloring, traceback highlighting, URLs. Follow / Clear / Open
-  Externally / Reveal Folder.
+  Proxy Connection
+- **History** — saved transcripts with 📋 Raw / 📋 Final copy icons
+- **Logs** — live-tailing `voxtype.log` / `voxtype.log.prev`
 
-Every toggle writes through to `data/settings.json` atomically and
-calls `config.reload()` — effective on the next request. Port changes
-(Whisper, Kokoro) take a Restart click.
+Every toggle writes through to `data/settings.json` atomically. Engine
+settings (model, device, compute type) trigger an automatic reload on
+next inference call.
 
 ---
 
@@ -162,8 +205,7 @@ voxtype/data/
 ```
 
 Override with `VOXTYPE_DATA_DIR=C:\some\other\path` if you want storage
-outside the repo. `voxtype/data/` is gitignored so your settings never
-travel with a commit.
+outside the repo. `voxtype/data/` is gitignored.
 
 ---
 
@@ -181,27 +223,19 @@ travel with a commit.
 ```
 
 `proxy_model` can be anything telecode's llamacpp registry recognises,
-OR anything in `proxy.model_mapping` (e.g. `claude-opus-4-6` if you've
-mapped it to a local model). VoxType sends OpenAI-shape
+OR anything in `proxy.model_mapping`. VoxType sends OpenAI-shape
 `/v1/chat/completions` with `response_format: json_schema` — the model
 returns structured output and VoxType extracts the `output` field.
 
-If the request fails, the **original Whisper transcript** is returned
-unchanged — dictation keeps working even when the LLM is unreachable.
+If the request fails, the **original STT transcript** is returned
+unchanged — dictation keeps working when the LLM is unreachable.
 
 ---
 
 ## Hotkey
 
-Defaults to **Ctrl + Win** (hold). Edit `settings.json`:
-
-```json
-"hotkey": { "key1": "ctrl", "key2": "cmd", "label": "Ctrl + Win" }
-```
-
-Valid key names: `ctrl`, `shift`, `alt`, `cmd` (Win), `space`, `enter`,
-`tab`, `esc`, `f1`–`f12`, single letters/digits. Set `key2` to `null`
-for a single-key hotkey like `f9`.
+Defaults to **Ctrl + Win** (hold). Use the **Rebind** button in
+Settings → Dictation to capture a new combo.
 
 `hotkey_mode` can be `"hold"` (dictate while held) or `"toggle"` (tap
 to start, tap to stop).
@@ -214,20 +248,16 @@ to start, tap to stop).
 .\uninstall.ps1
 ```
 
-Removes the scheduled task, kills orphaned child processes, and
-(interactively) offers to delete the install directory and repo-local
-`voxtype/data/`.
+Removes the scheduled task and (interactively) offers to delete the
+install directory and repo-local `voxtype/data/`.
 
 ---
 
 ## Known limitations
 
 - **Windows-only.** Typer uses PowerShell SendKeys; screen capture
-  uses Win32 `GetCursorPos`. A future cross-platform port would swap
-  those out for `pyautogui.typewrite` + `mss` without the Win32 bits.
-- **No rebind UI yet.** The hotkey is edited in `settings.json`. A
-  "capture next 1–2 keys" flow exists in `hotkey.py` but isn't wired
-  to a UI button yet.
+  uses Win32 `GetCursorPos`.
 - **No live mic device picker.** sounddevice picks the system default.
-- **Kokoro is unused by VoxType itself** — it's kept as a managed
-  sidecar for other tools that want TTS on `localhost:${port}`.
+- **TTS isn't wired into the dictation pipeline** — it's served via the
+  HTTP endpoint for external clients. Speak-back is not part of the
+  hotkey flow.

@@ -20,7 +20,7 @@ MAX_ENTRIES = 500
 @dataclass
 class Entry:
     timestamp: float            # unix seconds
-    raw: str                    # Whisper transcript
+    raw: str                    # STT transcript
     final: str                  # after LLM enhance (== raw if disabled)
     enhanced: bool              # did LLM enhance run?
     duration_ms: int            # time from hotkey-release to paste

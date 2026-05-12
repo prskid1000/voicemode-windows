@@ -18,3 +18,5 @@ voxtype-venv/
 Kokoro-FastAPI/
 .claude/
 _*.py
+
+.docgraph/

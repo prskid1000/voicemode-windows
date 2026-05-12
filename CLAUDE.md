@@ -6,27 +6,26 @@ User-facing docs: [README.md](README.md).
 
 VoxType is a **pure-Python / PySide6** voice-dictation overlay for
 Windows. Hold a hotkey, speak, release — the cleaned transcript is
-pasted at the cursor. The app owns the lifecycle of its sidecars
-(faster-whisper-server, optionally Kokoro-FastAPI) — one process tree,
-one scheduled task.
+pasted at the cursor. STT and TTS both run **in-process via ONNX
+Runtime** — no separate sidecar subprocesses, no separate venvs. An
+embedded aiohttp server exposes both on one OpenAI-compatible port
+(`:6600` by default) so external clients (telecode, MCP tools) can
+reach VoxType over standard HTTP.
 
 The original Electron/React implementation (`voxtype/src/`) has been
-deleted. All Node / npm / Electron / LM Studio references are gone
-from the tree. Grep for `electron`, `npm`, `lm.studio`, `voicemode` to
-verify.
+deleted. All Node / npm / Electron / LM Studio references are gone.
 
 LLM transcript cleanup is routed through
 **telecode's dual-protocol proxy** (`http://127.0.0.1:1235`) — see
 https://github.com/prskid1000/telecode. No direct LM Studio
 integration, no `lms` CLI calls, no model-list fetching. Whichever
-model telecode is supervising (via `llamacpp.models` + `model_mapping`)
-becomes VoxType's enhance backend.
+model telecode is supervising becomes VoxType's enhance backend.
 
 ## Project layout
 
 ```
 voxtype/
-├── setup.ps1                  # Idempotent installer: venvs + scheduled task
+├── setup.ps1                  # Idempotent installer: single venv + scheduled task
 ├── uninstall.ps1              # Reverse of setup
 ├── README.md                  # User-facing docs
 ├── CLAUDE.md                  # This file
@@ -38,30 +37,31 @@ voxtype/
     ├── main.py                # Orchestrator (Qt loop + asyncio worker + pynput thread)
     ├── types.py               # AppSettings / HotkeyCombo / PillState
     ├── config.py              # JSON I/O (voxtype/data/settings.json, hot-reload)
-    ├── debug_log.py           # Rotating logger (voxtype.log ↔ voxtype.log.prev)
+    ├── debug_log.py           # Rotating logger
     │
     ├── audio.py               # sounddevice → 16 kHz mono int16 PCM
-    ├── hotkey.py              # pynput.keyboard.Listener (hold/toggle/capture, stale-key sweep)
+    ├── hotkey.py              # pynput keyboard listener
     ├── vad.py                 # numpy RMS energy gate on PCM
-    ├── screen_capture.py      # mss + PIL, red cursor marker (ctypes GetCursorPos)
+    ├── screen_capture.py      # mss + PIL, red cursor marker
     ├── typer.py               # Clipboard + Ctrl+V via PowerShell SendKeys
-    ├── history.py             # Append-only JSON, last 500 entries
+    ├── history.py             # Append-only JSON
     │
-    ├── stt.py                 # Multipart POST to faster-whisper-server
-    ├── llm.py                 # OpenAI-shape POST to telecode proxy; JSON-schema; LRU cache
-    ├── process.py             # Subprocess lifecycle — Whisper + Kokoro supervisor, Job Object crash-safety, port sweep, auto-restart
-    ├── whisper_model.py       # Model catalog
-    ├── kokoro_voice.py        # Voice catalog + warmup ping
+    ├── stt_engine.py          # In-process STT — sherpa-onnx + HF auto-download
+    ├── tts_engine.py          # In-process TTS — onnxruntime/piper-tts + HF auto-download
+    ├── server.py              # Embedded aiohttp /v1/audio/* server
+    ├── stt.py                 # Shim → delegates to stt_engine
+    ├── llm.py                 # OpenAI-shape POST to telecode proxy
+    ├── process.py             # Facade over engines for tray UI + Job Object utilities
     │
-    ├── qt_theme.py            # Dark QSS (copy of telecode/tray/qt_theme.py)
-    ├── tray_menu.py           # QSystemTrayIcon + submenus (Whisper / Kokoro / LLM)
+    ├── qt_theme.py            # Dark QSS
+    ├── tray_menu.py           # QSystemTrayIcon + submenus (STT / TTS / LLM)
     ├── pill_window.py         # Frameless always-on-top status pill
     ├── settings_window.py     # Frameless sidebar settings window
     │
     ├── requirements.txt
     ├── resources/
     │   ├── icon.png
-    │   └── system-prompt.md   # LLM cleanup instructions (hot-read on every enhance)
+    │   └── system-prompt.md   # LLM cleanup instructions
     └── data/                  # User state — gitignored
         ├── settings.json
         ├── history.json
@@ -71,37 +71,92 @@ voxtype/
 
 ## Runtime architecture
 
-Three threads cooperate:
+```
+Main thread          Qt event loop — widgets, tray, pill, signal delivery
+voxtype-asyncio      asyncio loop — HTTP server, llm.enhance, engine load/unload
+voxtype-stt          single-thread executor — sherpa-onnx inference
+voxtype-tts          single-thread executor — ONNX synthesis
+pynput thread        raw keyboard hook
+```
 
-| Thread | Owned by | Responsibility |
-|---|---|---|
-| Main | `QApplication.exec()` | Qt widgets, tray, pill, settings window, paint, signal delivery |
-| `voxtype-asyncio` | `_AsyncLoopThread` in `main.py` | All HTTP (`stt.transcribe`, `llm.enhance`, `services._ping_once`) and subprocess management |
-| pynput internal | `pynput.keyboard.Listener` | Raw keyboard hook + key-name normalisation |
-
-Cross-thread handoff is **Qt signals** (pill state) or
+Cross-thread handoff is Qt signals (pill state) or
 `QTimer.singleShot(0, lambda: …)` (pulling async results back to the
-Qt thread). Never call Qt widget methods directly from the worker
-thread.
+Qt thread). Never call Qt widget methods directly from worker threads.
 
-Pipeline (`main.py:_pipeline`):
+Dictation pipeline (`main.py:_pipeline`):
 
 ```
-hotkey down  (pynput thread)
-  → QTimer.singleShot to Qt: recorder.start(), pill = recording
-hotkey up    (pynput thread)
-  → QTimer.singleShot to Qt: recorder.stop(), VAD gate
-  → loop.submit(_pipeline(pcm, settings))
-    → await stt.transcribe()
-    → if enhance_enabled: await llm.enhance() (with optional screenshot)
-    → await loop.run_in_executor(None, type_text, final)   # PowerShell blocking
-    → history.add(...)
-    → emit pill_state_req('idle', '')
+hotkey down  → recorder.start, pill = recording
+hotkey up    → recorder.stop → PCM buffer → VAD gate
+             → loop.submit(_pipeline(pcm, s))
+               → stt.transcribe(pcm, language=s.stt_language)
+                 ↳ direct call into stt_engine.STTEngine
+                   (no HTTP — the server is for external clients only)
+               → if enhance_enabled: await llm.enhance()
+               → loop.run_in_executor(None, type_text, final)
+               → history.add(...)
+               → emit pill_state_req('idle', '')
 ```
 
-Error path: `_flash_error(message)` → pill shows red for 2 s →
-auto-transitions back to idle. The original Whisper transcript is
-returned verbatim on any LLM failure so dictation keeps working.
+## In-process engines
+
+Both `stt_engine.py` and `tts_engine.py` are singletons, both ONNX
+Runtime backed, both with the same lifecycle API:
+
+```python
+from voxtype import stt_engine
+eng = stt_engine.get_engine()
+await eng.configure(settings)       # apply model_path / device / language
+await eng.ensure_loaded()           # load the model (lazy on first request)
+text = await eng.transcribe(pcm)    # inference in single-thread executor
+await eng.unload()                  # release model, gc.collect
+```
+
+STT uses `sherpa-onnx` (any sherpa-compatible Whisper / Paraformer /
+Zipformer export). TTS uses `piper-tts` on top of `onnxruntime`.
+
+Each engine:
+- Accepts either a **local path** or a **HuggingFace repo ID** as the
+  model setting. Repo IDs are auto-downloaded via `huggingface_hub.
+  snapshot_download()` to the HF cache on first load and reused after.
+- Holds a single `ThreadPoolExecutor(max_workers=1)` so concurrent
+  inference can't OOM the GPU
+- Tracks a `_loaded_key` tuple — `configure()` calls that change the
+  key trigger an automatic unload so the next request rebuilds with
+  the new settings
+- Spawns an idle-watcher thread that calls `unload()` after
+  `idle_unload_sec` of inactivity (0 = never unload)
+- CPU/CUDA switching is the ONNX Runtime provider list. If
+  `onnxruntime-gpu` isn't installed or CUDA init fails, ORT silently
+  drops to the CPU provider — no manual fallback logic needed
+
+`process.py` is now a thin facade — `get_status("whisper")` / 
+`start_whisper(s)` / `restart_service("tts", s)` route through to the
+engine singletons. The Job Object + kill_process_tree utilities are
+kept for future subprocess additions but aren't wired to anything
+right now.
+
+## Embedded HTTP server (`server.py`)
+
+aiohttp app, starts in `_boot_engines()` via `server.start(port=...)`.
+Routes:
+
+```
+POST /v1/audio/transcriptions   →  stt_engine.transcribe (multipart)
+POST /v1/audio/speech           →  tts_engine.synthesize (JSON in, WAV out)
+GET  /v1/models                 →  engine list
+GET  /health                    →  engine readiness snapshot
+GET  /                          →  liveness probe
+```
+
+Decodes WAV directly; falls through to `soundfile` for other formats.
+Resamples to 16 kHz mono int16 PCM before handing to the engine.
+Single port — both routes live on the same server.
+
+The dictation hot path inside VoxType calls the engines directly. The
+server is purely for external consumers (telecode `voice/stt.py` +
+`voice/tts.py`, the MCP `transcribe` / `speak` tools, anything else
+that speaks OpenAI's audio API).
 
 ## Settings & hot-reload
 
@@ -112,177 +167,90 @@ Every UI toggle calls `config.patch("path.to.key", value)` which:
 2. Atomically writes `data/settings.json` (tmp + `os.replace`)
 3. Any subsequent `config.load()` sees the new value
 
-**What takes effect immediately**: enhance toggle, VAD, append mode,
-proxy URL/model, system prompt content (re-read on every
-`llm.enhance` call).
+**Immediate effect**: enhance toggle, VAD, append mode, proxy
+URL/model, system prompt content (re-read on every `llm.enhance`).
 
-**What needs a Restart click**: Whisper port/model/device, Kokoro
-port/voice/device. Use the "Restart" button in the tray submenu or
-the corresponding section of the settings window.
+**Effect on next inference call**: stt_model_path, stt_device,
+tts_model_path, tts_device. The engine's `configure()` notices the
+key change and unloads so the next request rebuilds.
 
-`VOXTYPE_DATA_DIR` env var overrides the default `voxtype/data/` path
-if you want settings/history/logs somewhere else.
-
-## Sidecar lifecycle (`process.py`)
-
-Everything subprocess-related lives in one file, mirroring telecode's
-`process.py`. Two layers:
-
-**Generic primitives** (top)
-- Windows kill-on-close Job Object (`_bind_to_lifetime_job`) — every
-  spawned child dies with the interpreter even on Task Manager End
-  Process / pythonw crash / logoff. Prevents orphans holding our port.
-- `_sweep_port(name, port)` — command-line-aware orphan killer.
-  Matches on both the owning exe and argv (since sidecars under our
-  venv are often launched by pyenv's python.exe).
-- `_kill_tree` — `taskkill /T` walks the parent-PID map.
-- `atexit` fallback for clean-exit paths where the Job Object wasn't
-  available (pywin32 missing).
-
-**Sidecar supervisors** (bottom)
-- `start_whisper(cfg)` / `start_kokoro(cfg)` — spawn + `_drain` stdout
-  into the log + `_wait_ready` probe `/health` (poll-death guard +
-  post-probe stability check to catch an orphan answering on our port).
-- `_watch_exit(m)` — auto-restart on unexpected exit with exponential
-  backoff (1s, 2s, 4s, …, capped at 30s); the scheduled restart no-ops
-  if a lazy `_ensure_*_running()` already revived the service, so we
-  don't double-spawn and lose the bind race.
-- `stop_service(name)` — `taskkill /PID <pid> /T` (graceful), 3 s
-  wait, then `/F` if still alive.
-- `stop_all()` — concurrent stop of every managed service.
-
-All spawned children carry `subprocess.CREATE_NO_WINDOW` so they don't
-pop a console under `pythonw.exe`.
+**Requires server restart**: server_port. The "Reload STT" / "Reload TTS"
+buttons are the easiest way to apply changes immediately.
 
 ## LLM enhance (`llm.py`)
 
-Zero LM Studio references. Sends to
-`{proxy_url}/v1/chat/completions` with:
-
-```json
-{
-  "model": "<proxy_model>",
-  "messages": [
-    {"role": "system", "content": "<system-prompt.md>"},
-    {"role": "user",   "content": "<text + optional image_url>"}
-  ],
-  "temperature": 0,
-  "max_tokens": 4096,
-  "response_format": {
-    "type": "json_schema",
-    "json_schema": { ... output ... }
-  }
-}
-```
-
-- **LRU cache** (50 entries) keyed on `(transcript, screenshot_fingerprint)`
-- **4-stage JSON recovery**: strict → largest `{…}` block → regex
-  extract of `"output": "..."` → raw text
-- **2-retry loop** with linear backoff
-- **Sanity checks**: empty `output` → original; 3× length blow-up →
-  original
-
-`proxy_alive(proxy_url)` does a GET on `/v1/models` so the tray can
-show live reachability.
-
-## Hotkey (`hotkey.py`)
-
-- Stores canonical key names as strings (`ctrl`, `cmd`, `f9`, etc.) —
-  **not** numeric keycodes. Portable across keyboard layouts.
-- Stale-key sweep every 2 s drops any key held >5 s (Windows Start
-  menu sometimes eats the keyup for Meta/Win).
-- Capture mode (`hotkey.capture(cb)`) waits for 1–2 keys after the
-  user has released everything currently held, then fires `cb(combo)`.
-  Wired to a UI button is a TODO.
+Unchanged. Posts to `{proxy_url}/v1/chat/completions` with
+`response_format: json_schema`. LRU cache (50 entries), 4-stage JSON
+recovery, 2-retry loop. On failure, returns the raw STT transcript
+verbatim.
 
 ## Tray + Settings UI
 
-QSS is a verbatim copy of `telecode/tray/qt_theme.py` so the two apps
-feel identical. Sidebar sections:
+Sidebar sections:
+- **Dictation** — hotkey mode, Rebind button, auto-stop, VAD, append, save history
+- **Services** — three cards (symmetric STT + TTS):
+  - **OpenAI HTTP Server** (port, enabled)
+  - **STT** (model field accepts HF repo or local path + Browse + Check, device, language, Reload)
+  - **TTS** (model field accepts HF repo or local path + Browse + Check, device, speaker, length scale, Reload)
+- **LLM** — enhance, screen context, proxy URL/model, Test Proxy
+- **History** — saved transcripts with Copy buttons
+- **Logs** — live tail
 
-- **Dictation** — hotkey mode, hotkey label (read-only for now),
-  auto-stop, VAD, append, save history
-- **Services** — Whisper + Kokoro enable/port/model/voice/device +
-  Restart buttons
-- **LLM** — enhance / screen context toggles, proxy URL + model, Test
-  Proxy Connection
-
-Tray submenus mirror the three upstream concerns (Whisper / Kokoro /
-LLM) with a status line and a Restart / Test Proxy action each.
-
-## Pill overlay (`pill_window.py`)
-
-Frameless, always-on-top, tool window (hidden from taskbar), translucent
-background, does-not-accept-focus. Dragging persists `pill_x` /
-`pill_y` to settings. Six states → six drawings in `paintEvent`:
-
-| state | visual |
-|---|---|
-| idle | hidden |
-| recording | red filled dot + "Listening" |
-| processing | amber spinning arc + "Transcribing" |
-| enhancing | blue spinning arc + "Enhancing" |
-| typing | green filled dot + "Typing" |
-| error | red dot + message (dwells 2 s then → idle) |
-
-## Quit behaviour
-
-- `orchestrator.quit()` called by tray Quit or SIGINT
-- Stops pynput listener
-- Submits `services.stop_all()` to the worker loop, waits 6 s
-- Hides tray, calls `app.quit()`
-- Starts a 5-second `threading.Timer` that calls `os._exit(0)` — any
-  stuck thread, async hang, or non-daemon child is force-killed
+Tray submenus mirror the three upstream concerns (STT / TTS / LLM)
+with status + Load / Unload / Reload actions.
 
 ## Setup script (`setup.ps1`)
 
-Phases are all idempotent — re-running on a fully-installed machine
+Single venv. Idempotent — re-running on a fully-installed machine
 takes ~10 s.
 
-1. **Prereqs**: Python 3.10+ via pyenv or system install, git, ffmpeg
-   (warn-only), NVIDIA GPU (warn-only for CPU fallback)
-2. **VoxType venv**: `voxtype-venv/` + `pip install -r
-   voxtype/requirements.txt`
-3. **Whisper venv**: `stt-venv/` + `pip install faster-whisper-server`
-   + patch `api.py` tomllib lookup
-4. **Kokoro venv** (unless `-SkipKokoro`): clone repo, `tts-venv/`,
-   install PyTorch (CUDA or CPU), pip install `-e .`, download model
-5. **Scheduled task** `VoxType`: runs
-   `voxtype-venv\Scripts\pythonw.exe -m voxtype` at logon, hidden,
-   with `RestartCount=3`
-6. **Seed settings**: `data/settings.json` created with chosen
-   `whisper_model`
+1. **Prereqs**: Python 3.10+, git, ffmpeg (warn-only), GPU detection
+2. **Migration**: remove legacy `stt-venv/`, `tts-venv/`,
+   `Kokoro-FastAPI/` from older installs
+3. **Single venv**: `voxtype-venv/` + `pip install -r voxtype/requirements.txt`
+   (PySide6, pynput, sounddevice, aiohttp, sherpa-onnx, piper-tts,
+   huggingface_hub)
+4. **GPU runtime** (if `-GpuSupport $true`): swap CPU `onnxruntime` for
+   `onnxruntime-gpu` so both STT and TTS land on CUDA when `device='cuda'`
+5. **Scheduled task** `VoxType`: runs `pythonw.exe -m voxtype` at logon
+6. **Seed settings**: empty `data/settings.json` with the AppSettings
+   defaults (user picks STT/TTS models from the settings window)
 
-No Node, no npm, no Electron, no `lms server start`. Grep the script
-to confirm.
+Parameters: `-GpuSupport`, `-SkipTTS`, `-InstallDir`.
 
-## Uninstall (`uninstall.ps1`)
+## What changed in the in-process refactor
 
-- Unregisters `VoxType` (and legacy tasks)
-- Kills orphan `faster-whisper-server` / `uvicorn` / `pythonw` / `python`
-  processes under `$InstallDir`
-- Interactively offers to delete:
-  - `voxtype/data/` (repo-local user data)
-  - Legacy `%USERPROFILE%\.voxtype` (pre-repo-local layout)
-  - Legacy `%USERPROFILE%\.voicemode` (old voice-mode MCP data)
-  - `$InstallDir` itself (~3 GB of venvs + Kokoro model)
+Removed:
+- `stt-venv/`, `tts-venv/`, `Kokoro-FastAPI/` clone
+- `voxtype/kokoro_voice.py` (voice catalog gone — the model file IS the voice)
+- `voxtype/whisper_model.py` (model dropdown gone — free-text repo/path)
+- All Kokoro settings (`kokoro_*` keys)
+- All Whisper-prefixed settings (`whisper_*` → `stt_*`)
+- Per-service port fields (`whisper_port`, `kokoro_port` → single `server_port`)
+- Subprocess lifecycle in `process.py` — `_spawn_whisper`, `_spawn_kokoro`,
+  `_wait_ready`, `_drain`, `_force_cpu_restart`, GPU-broken stdout sniffer
+- HTTP client in `stt.py` (replaced by direct engine delegate)
+- `faster-whisper` dependency (replaced by `sherpa-onnx`)
+
+Added:
+- `voxtype/stt_engine.py` — `STTEngine` singleton, sherpa-onnx + HF auto-download
+- `voxtype/tts_engine.py` — `TTSEngine` singleton, onnxruntime + HF auto-download
+- `voxtype/server.py` — embedded aiohttp `/v1/audio/*` server
+- `stt_*` and `tts_*` settings — symmetric structure (enabled, auto_start,
+  idle_unload_sec, model_path, device, language/speaker)
+- `server_enabled`, `server_port` settings
 
 ## Testing
 
-No formal test suite yet. Manual smoke:
-
 ```powershell
-# stop the running task first if any
 Stop-ScheduledTask -TaskName VoxType
-
-# run in foreground so stderr is visible
 .\voxtype-venv\Scripts\python.exe -m voxtype
 ```
 
-Expected:
+Smoke test:
 - Tray icon appears
 - `data/voxtype.log` starts filling
-- Hotkey press produces a red pill; release produces a transcript
-- With `proxy_url` live, "Test Proxy" returns `● reachable`
-- With telecode up and `enhance_enabled`, filler words are cleaned in
-  the final paste
+- First hotkey: pill goes red → amber (whisper loading) → green text
+- `curl http://127.0.0.1:6600/health` returns engine status JSON
+- `curl http://127.0.0.1:6600/v1/models` lists `whisper-1` + `tts-1`
+- With telecode up: filler words cleaned in the final paste
