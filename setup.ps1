@@ -144,14 +144,18 @@ if (-not $GpuSupport) {
     Write-Host "    pip install torch (CPU)..." -ForegroundColor DarkGray
 }
 
+# Install torch + numpy together so torch's first import doesn't print
+# the noisy "Failed to initialize NumPy" warning on the sanity check.
+# numpy is in requirements.txt too — pip dedupes the second install.
 $pipExtra = @()
 if ($CudaVersion -eq "cu130" -and $GpuSupport) { $pipExtra += "--pre" }
-& "$voxVenv\Scripts\pip.exe" install @pipExtra torch --index-url $torchIndex --no-cache-dir --quiet 2>&1 | Out-Null
+& "$voxVenv\Scripts\pip.exe" install @pipExtra torch "numpy>=1.26" --index-url $torchIndex --extra-index-url https://pypi.org/simple --no-cache-dir --quiet 2>&1 | Out-Null
 
 if (-not (Test-Path "$voxVenv\Lib\site-packages\torch")) {
     Fail "torch install failed (tried index $torchIndex)"
 }
-$torchCudaCheck = & $voxPython -c "import torch; print(torch.version.cuda or 'cpu')" 2>&1
+# stderr captured separately so any residual warnings don't pollute the cuda string.
+$torchCudaCheck = & $voxPython -c "import torch; print(torch.version.cuda or 'cpu')" 2>$null
 Ok "torch installed (cuda=$torchCudaCheck)"
 
 # ── Remaining deps (PySide6, transformers, kokoro, …) ───────────────
