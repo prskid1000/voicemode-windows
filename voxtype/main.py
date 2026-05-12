@@ -107,6 +107,11 @@ class Orchestrator(QObject):
 
         self.window = SettingsWindow(
             restart_service=self._restart_service,
+            start_service=self._start_service,
+            stop_service=self._stop_service,
+            start_server=self._start_server,
+            stop_server=self._stop_server,
+            restart_server=self._restart_server,
             capture_hotkey=self._capture_hotkey,
             set_hotkey=self._apply_hotkey,
         )
@@ -376,6 +381,31 @@ class Orchestrator(QObject):
 
     def _stop_service(self, name: str) -> None:
         self._loop.submit(process.stop_service(name))
+
+    def _start_server(self) -> None:
+        async def _do() -> None:
+            s = config.load()
+            try:
+                await server.start(port=s.server_port)
+            except Exception as exc:
+                log.error("server start failed: %s", exc)
+        self._loop.submit(_do())
+
+    def _stop_server(self) -> None:
+        self._loop.submit(server.stop())
+
+    def _restart_server(self) -> None:
+        async def _do() -> None:
+            s = config.load()
+            try:
+                await server.stop()
+            except Exception:
+                pass
+            try:
+                await server.start(port=s.server_port)
+            except Exception as exc:
+                log.error("server restart failed: %s", exc)
+        self._loop.submit(_do())
 
     def _probe_proxy(self) -> None:
         async def _do():

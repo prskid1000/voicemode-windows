@@ -12,7 +12,7 @@ import asyncio
 import logging
 from typing import Callable
 
-from PySide6.QtCore import Qt, QPoint, Signal
+from PySide6.QtCore import Qt, QPoint, QTimer, Signal
 from PySide6.QtGui import QMouseEvent
 from PySide6.QtWidgets import (
     QMainWindow, QWidget, QVBoxLayout, QHBoxLayout, QLabel, QListWidget,
@@ -357,10 +357,12 @@ def _line_edit_static(text: str) -> QLineEdit:
     return le
 
 
-def _hf_check_button(line_edit: QLineEdit, status_lbl: QLabel) -> QPushButton:
+def _hf_check_button(line_edit: QLineEdit, status_lbl: QLabel,
+                      default_model: str = "") -> QPushButton:
     """`Check` button that pings huggingface.co/api/models/<id> or, if
     the entered value looks like a local path, just checks existence.
-    Mirrors the DocGraph reranker pattern in telecode."""
+    Empty field → checks the built-in default. Mirrors the DocGraph
+    reranker pattern in telecode."""
     from voxtype.qt_theme import OK, ERR, WARN
     btn = QPushButton("Check")
     btn.setProperty("class", "ghost")
@@ -369,7 +371,7 @@ def _hf_check_button(line_edit: QLineEdit, status_lbl: QLabel) -> QPushButton:
     async def _do_check() -> None:
         from pathlib import Path
         import aiohttp
-        text = line_edit.text().strip()
+        text = (line_edit.text().strip() or default_model).strip()
         if not text:
             status_lbl.setText("(empty)")
             status_lbl.setStyleSheet(f"color: {FG_MUTE}; font-size: 11px;")
@@ -457,13 +459,109 @@ def _model_row(path_field: str, default_model: str = "") -> QWidget:
     status.setMinimumWidth(86)
     status.setStyleSheet(f"color: {FG_MUTE}; font-size: 11px;")
     le.textChanged.connect(lambda _t: (status.setText(""), None)[1])
-    check = _hf_check_button(le, status)
+    check = _hf_check_button(le, status, default_model)
 
     h.addWidget(le, 1)
     h.addWidget(browse)
     h.addWidget(check)
     h.addWidget(status)
     return w
+
+
+def _lifecycle_row(load_label: str, unload_label: str, reload_label: str,
+                    on_load: Callable[[], None],
+                    on_unload: Callable[[], None],
+                    on_reload: Callable[[], None],
+                    status_getter: Callable[[], tuple[str, str]]) -> QWidget:
+    """Card-footer row: [● status text]      [Load] [Unload] [Reload].
+
+    `status_getter()` returns (text, kind) where kind ∈
+    {"ok", "busy", "idle", "err", "off"} — drives pill colour. Polled
+    once a second via a QTimer parented to the returned widget."""
+    from voxtype.qt_theme import OK, ERR, WARN, ACCENT
+
+    row = QWidget()
+    h = QHBoxLayout(row)
+    h.setContentsMargins(0, 4, 0, 0)
+    h.setSpacing(8)
+
+    pill = QLabel("○ —")
+    pill.setStyleSheet(f"color: {FG_MUTE}; font-size: 11.5px;")
+    h.addWidget(pill)
+    h.addStretch(1)
+
+    def _mk(label: str, cb: Callable[[], None]) -> QPushButton:
+        b = QPushButton(label)
+        b.setProperty("class", "ghost")
+        b.setFixedHeight(28)
+        b.clicked.connect(lambda: _safe(cb))
+        return b
+
+    def _safe(cb: Callable[[], None]) -> None:
+        try:
+            cb()
+        except Exception as exc:
+            log.error("lifecycle action failed: %s", exc)
+
+    btn_load   = _mk(load_label,   on_load)
+    btn_unload = _mk(unload_label, on_unload)
+    btn_reload = _mk(reload_label, on_reload)
+    h.addWidget(btn_load)
+    h.addWidget(btn_unload)
+    h.addWidget(btn_reload)
+
+    KINDS = {
+        "ok":   (OK,      "●"),
+        "busy": (WARN,    "◐"),
+        "idle": (FG_MUTE, "○"),
+        "err":  (ERR,     "✗"),
+        "off":  (FG_MUTE, "○"),
+    }
+
+    def _refresh() -> None:
+        try:
+            text, kind = status_getter()
+        except Exception:
+            text, kind = ("error", "err")
+        color, glyph = KINDS.get(kind, (FG_MUTE, "○"))
+        pill.setText(f"{glyph} {text}")
+        pill.setStyleSheet(f"color: {color}; font-size: 11.5px;")
+        # Enable/disable buttons by state
+        btn_load.setEnabled(kind in ("idle", "off", "err"))
+        btn_unload.setEnabled(kind in ("ok", "busy"))
+        btn_reload.setEnabled(kind != "off")
+
+    _refresh()
+    timer = QTimer(row)
+    timer.setInterval(1000)
+    timer.timeout.connect(_refresh)
+    timer.start()
+    return row
+
+
+def _engine_status(name: str) -> tuple[str, str]:
+    """Translate process.get_status('stt'|'tts') into (text, kind)."""
+    from voxtype import process
+    s_cfg = config.load()
+    enabled = bool(getattr(s_cfg, f"{name}_enabled", False))
+    if not enabled:
+        return ("disabled", "off")
+    s = process.get_status(name)
+    if s.ready:
+        return ("ready", "ok")
+    if s.running:
+        return ("loading…", "busy")
+    if s.last_error:
+        return (f"error: {s.last_error[:48]}", "err")
+    return ("unloaded", "idle")
+
+
+def _server_status() -> tuple[str, str]:
+    from voxtype import server
+    s_cfg = config.load()
+    if not s_cfg.server_enabled:
+        return ("disabled", "off")
+    return ("running", "ok") if server.is_running() else ("stopped", "idle")
 
 
 def _build_services(window) -> QWidget:
@@ -478,6 +576,13 @@ def _build_services(window) -> QWidget:
         "for local dictation."),
         _checkbox("server_enabled", "Run embedded server")))
     srv_body.addWidget(_row(_label("Port"), _spin("server_port", 1024, 65535)))
+    srv_body.addWidget(_lifecycle_row(
+        "Start", "Stop", "Restart",
+        on_load=lambda: window.start_server(),
+        on_unload=lambda: window.stop_server(),
+        on_reload=lambda: window.restart_server(),
+        status_getter=_server_status,
+    ))
     layout.addWidget(srv_card)
 
     # ── STT card ───────────────────────────────────────────────────
@@ -504,10 +609,13 @@ def _build_services(window) -> QWidget:
     s_body.addWidget(_row(_label("Language",
         "ISO 639-1 code (en, de, ja, etc.). Leave 'en' for English."),
         _line_edit("stt_language")))
-    restart_stt = QPushButton("Reload STT")
-    restart_stt.setProperty("class", "ghost")
-    restart_stt.clicked.connect(lambda: window.restart_service("stt"))
-    s_body.addWidget(restart_stt)
+    s_body.addWidget(_lifecycle_row(
+        "Load", "Unload", "Reload",
+        on_load=lambda: window.start_service("stt"),
+        on_unload=lambda: window.stop_service("stt"),
+        on_reload=lambda: window.restart_service("stt"),
+        status_getter=lambda: _engine_status("stt"),
+    ))
     layout.addWidget(s_card)
 
     # ── TTS card ───────────────────────────────────────────────────
@@ -536,10 +644,13 @@ def _build_services(window) -> QWidget:
     t_body.addWidget(_row(_label("Length Scale",
         "Speech rate. >1.0 = slower. Most voices sound good at 1.0."),
         _slider_float("tts_length_scale", 0.5, 2.0, 0.05, suffix="x")))
-    restart_tts = QPushButton("Reload TTS")
-    restart_tts.setProperty("class", "ghost")
-    restart_tts.clicked.connect(lambda: window.restart_service("tts"))
-    t_body.addWidget(restart_tts)
+    t_body.addWidget(_lifecycle_row(
+        "Load", "Unload", "Reload",
+        on_load=lambda: window.start_service("tts"),
+        on_unload=lambda: window.stop_service("tts"),
+        on_reload=lambda: window.restart_service("tts"),
+        status_getter=lambda: _engine_status("tts"),
+    ))
     layout.addWidget(t_card)
 
     layout.addStretch(1)
@@ -952,10 +1063,20 @@ def _build_logs(window) -> QWidget:
 class SettingsWindow(QMainWindow):
     def __init__(self,
                  restart_service: Callable[[str], None],
+                 start_service: Callable[[str], None] | None = None,
+                 stop_service: Callable[[str], None] | None = None,
+                 restart_server: Callable[[], None] | None = None,
+                 start_server: Callable[[], None] | None = None,
+                 stop_server: Callable[[], None] | None = None,
                  capture_hotkey: Callable[[Callable], None] | None = None,
                  set_hotkey: Callable[[object], None] | None = None) -> None:
         super().__init__()
         self._restart_service = restart_service
+        self._start_service = start_service
+        self._stop_service = stop_service
+        self._restart_server = restart_server
+        self._start_server = start_server
+        self._stop_server = stop_server
         self._capture_hotkey = capture_hotkey
         self._set_hotkey = set_hotkey
         self.setWindowTitle("VoxType")
@@ -1000,6 +1121,26 @@ class SettingsWindow(QMainWindow):
 
     def restart_service(self, name: str) -> None:
         self._restart_service(name)
+
+    def start_service(self, name: str) -> None:
+        if self._start_service:
+            self._start_service(name)
+
+    def stop_service(self, name: str) -> None:
+        if self._stop_service:
+            self._stop_service(name)
+
+    def start_server(self) -> None:
+        if self._start_server:
+            self._start_server()
+
+    def stop_server(self) -> None:
+        if self._stop_server:
+            self._stop_server()
+
+    def restart_server(self) -> None:
+        if self._restart_server:
+            self._restart_server()
 
     def capture_hotkey(self, cb: Callable) -> None:
         if self._capture_hotkey:

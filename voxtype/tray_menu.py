@@ -240,26 +240,41 @@ class Tray:
                 self._llm_menu.setTitle("⬡ LLM: Unreachable")
                 self._llm_status.setText(f"no response from {settings.proxy_url}")
 
-        # Tray hover tooltip
+        # Tray hover tooltip — both engines fall back to the built-in
+        # default when the model_path setting is blank.
+        from voxtype.stt_engine import DEFAULT_MODEL as _STT_DEFAULT
+        from voxtype.tts_engine import DEFAULT_MODEL as _TTS_DEFAULT
+
+        def _short(path: str) -> str:
+            return path.split("\\")[-1].split("/")[-1]
+
         bits: list[str] = [f"VoxType · hotkey {settings.hotkey.label}"]
         if settings.stt_enabled:
             ws = process.get_status("stt")
+            chosen = settings.stt_model_path or _STT_DEFAULT
+            model_short = _short(chosen)
             if ws.ready:
-                model_short = (settings.stt_model_path.split("\\")[-1].split("/")[-1]
-                                or "(no model)")
                 bits.append(f"STT {model_short}")
             elif ws.running:
-                bits.append("STT loading…")
+                bits.append(f"STT loading… ({model_short})")
             else:
-                bits.append("STT unloaded")
+                bits.append(f"STT unloaded ({model_short})")
         else:
             bits.append("STT off")
-        if status.last_checked:
-            bits.append(f"LLM {'ok' if status.reachable else 'down'} · {settings.proxy_model}")
         if settings.tts_enabled:
             ts = process.get_status("tts")
+            chosen = settings.tts_model_path or _TTS_DEFAULT
+            model_short = _short(chosen)
             if ts.ready:
-                bits.append(f"TTS ready")
+                bits.append(f"TTS {model_short}")
+            elif ts.running:
+                bits.append(f"TTS loading… ({model_short})")
+            else:
+                bits.append(f"TTS unloaded ({model_short})")
+        else:
+            bits.append("TTS off")
+        if status.last_checked:
+            bits.append(f"LLM {'ok' if status.reachable else 'down'} · {settings.proxy_model}")
         if settings.server_enabled:
             bits.append(f"HTTP :{settings.server_port}")
         self.tray.setToolTip("\n".join(bits))
