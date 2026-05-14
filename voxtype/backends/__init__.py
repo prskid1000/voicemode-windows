@@ -1,26 +1,15 @@
 """Pluggable STT / TTS backends.
 
-Each engine (`voxtype.stt_engine`, `voxtype.tts_engine`) is a thin
-orchestrator: it owns lifecycle (load / unload / idle-watcher /
-listener notifications) and delegates the heavy lifting to a
-swappable backend selected by `settings.{stt,tts}_backend`.
+VoxType ships ONE generic STT backend and ONE generic TTS backend that
+between them cover almost every open-source model family available on
+HuggingFace: Whisper, Wav2Vec2, HuBERT, WavLM, MMS, SeamlessM4T,
+Moonshine, Speech2Text, SpeechT5 (ASR + TTS), Qwen-Audio, Parakeet,
+VITS / MMS-TTS, Bark, Parler-TTS, Kokoro, and anything else HF
+registers under `automatic-speech-recognition` / `text-to-speech`.
 
-A backend is a subclass of `STTBackend` / `TTSBackend` (see
-`stt_base.py` / `tts_base.py`). It owns:
-  - which Python library to import on `load_sync()`
-  - model resolution rules (HF repo / local path / curated id)
-  - inference (sync, run from the engine's single-thread executor)
-  - catalog of supported voices / languages
-  - whether `torch.compile`, fp16, streaming, etc. are honored
-
-Backends are registered in the modality registries below and looked
-up by name. Adding a new backend is one new module + one line in
-the registry.
-
-A backend module that fails to import (missing optional dep) is
-skipped silently — the registry still works, the missing backend
-is just not selectable until the user runs setup.ps1 with the
-right extras.
+Pasting any HF repo id (or local path) into the model field is the
+only user action — the backend sniffs the model's config.json,
+auto-detects its family, and exposes the right per-family options.
 """
 from __future__ import annotations
 
@@ -46,19 +35,24 @@ def _register_stt(name: str, module_path: str, cls_name: str) -> None:
         log.info("stt backend %r unavailable: %s", name, exc)
 
 
-_register_stt("whisper", "voxtype.backends.whisper", "WhisperBackend")
-# Add new STT backends here (faster-whisper, parakeet, …) — one line each.
+_register_stt("generic", "voxtype.backends.generic_stt", "GenericSTTBackend")
 
 
 def stt_backend_names() -> list[str]:
     return list(_STT.keys())
 
 
-def get_stt_backend(name: str) -> STTBackend:
-    cls = _STT.get(name) or _STT.get("whisper")
+def get_stt_backend(name: str = "generic") -> STTBackend:
+    cls = _STT.get(name) or _STT.get("generic")
     if cls is None:
-        raise RuntimeError("no STT backend available (transformers not installed?)")
+        raise RuntimeError("no STT backend available (transformers missing?)")
     return cls()
+
+
+def resolve_stt_backend(model_id: str = "") -> STTBackend:
+    """Pick a backend instance to handle `model_id`. The generic backend
+    always wins — it dispatches internally to a family-specific handler."""
+    return get_stt_backend("generic")
 
 
 # ── TTS registry ─────────────────────────────────────────────────────
@@ -74,16 +68,19 @@ def _register_tts(name: str, module_path: str, cls_name: str) -> None:
         log.info("tts backend %r unavailable: %s", name, exc)
 
 
-_register_tts("kokoro", "voxtype.backends.kokoro", "KokoroBackend")
-# Add new TTS backends here (piper, coqui, parler, …) — one line each.
+_register_tts("generic", "voxtype.backends.generic_tts", "GenericTTSBackend")
 
 
 def tts_backend_names() -> list[str]:
     return list(_TTS.keys())
 
 
-def get_tts_backend(name: str) -> TTSBackend:
-    cls = _TTS.get(name) or _TTS.get("kokoro")
+def get_tts_backend(name: str = "generic") -> TTSBackend:
+    cls = _TTS.get(name) or _TTS.get("generic")
     if cls is None:
         raise RuntimeError("no TTS backend available")
     return cls()
+
+
+def resolve_tts_backend(model_id: str = "") -> TTSBackend:
+    return get_tts_backend("generic")

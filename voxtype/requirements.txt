@@ -15,12 +15,29 @@ pywin32>=306; platform_system == "Windows"
 # picks the right index URL based on -GpuSupport.
 torch>=2.4
 
-# STT backend — pluggable. Currently ships `whisper` (HuggingFace
-# transformers + WhisperForConditionalGeneration). New backends slot
-# into voxtype/backends/ and register themselves in __init__.py.
+# Generic STT + TTS backends — one transformers install handles every
+# HF-hosted model family we support: Whisper, Wav2Vec2, HuBERT, WavLM,
+# MMS, SeamlessM4T, Moonshine, SpeechT5 (ASR + TTS), VITS / MMS-TTS,
+# Bark, Speech2Text, etc. The model architecture is auto-detected
+# from the repo's config.json at load time.
 transformers>=4.45
 huggingface_hub>=0.24
 
-# TTS backend — pluggable. Currently ships `kokoro` (kokoro PyPI +
-# Kokoro-82M; 54 voices across 9 langs, PyTorch).
+# Required by SeamlessM4T / Speech2Text tokenizers.
+sentencepiece>=0.2
+
+# Required for SpeechT5 speaker-embedding loading (datasets pulls
+# the cmu-arctic-xvectors HF dataset on first use).
+datasets>=2.20
+
+# Kokoro TTS — separate PyPI package wrapping Kokoro-82M.
 kokoro>=0.5
+
+# Optional: Parler-TTS (style-prompt synthesis). Generic TTS backend
+# falls back to transformers.pipeline if this is missing.
+#parler-tts>=0.2
+
+# Optional: phonemizer / espeak — needed by some VITS / Bark / Parler
+# voices. Generic backend tolerates absence (output may be empty for
+# non-English VITS).
+#phonemizer>=3.2

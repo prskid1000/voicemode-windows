@@ -12,7 +12,7 @@ import asyncio
 import logging
 from typing import Callable
 
-from PySide6.QtCore import Qt, QPoint, QTimer, Signal
+from PySide6.QtCore import Qt, QPoint, QTimer, Signal, QObject
 from PySide6.QtGui import QMouseEvent
 from PySide6.QtWidgets import (
     QMainWindow, QWidget, QVBoxLayout, QHBoxLayout, QLabel, QListWidget,
@@ -357,164 +357,95 @@ def _line_edit_static(text: str) -> QLineEdit:
     return le
 
 
-def _detect_family(meta: dict, repo_id: str) -> str:
-    """Return one of {'whisper', 'kokoro', ''} based on HF model metadata.
-    Uses pipeline_tag + tags + the repo id itself. We're permissive — a
-    match on any single signal is enough."""
-    rid = (repo_id or "").lower()
-    tags = [str(t).lower() for t in (meta.get("tags") or [])]
-    pipeline = str(meta.get("pipeline_tag") or "").lower()
-    cfg = meta.get("config") or {}
-    model_type = str(cfg.get("model_type") or "").lower()
-
-    if model_type == "whisper" or "whisper" in rid or "whisper" in tags:
-        return "whisper"
-    if "kokoro" in rid or "kokoro" in tags:
-        return "kokoro"
-    # Hint from pipeline tag alone is too loose (e.g. wav2vec2 is also
-    # automatic-speech-recognition) — keep empty.
-    _ = pipeline
-    return ""
+class _DetectBridge(QObject):
+    """Thread bridge for the Detect button. Worker thread `emit`s into
+    `done`; Qt delivers the slot call on the GUI thread because the
+    bridge instance is created there. `QTimer.singleShot` from a
+    non-Qt thread is unreliable — Signal/Slot is the canonical fix."""
+    done = Signal(str, str)   # (family, family_label)
 
 
-def _local_family(path) -> str:
-    """Peek at a local model directory's config.json to detect family.
-    Used when the entered path is a real file/dir on disk."""
-    from pathlib import Path
-    import json
-    p = Path(path)
-    if not p.exists():
-        return ""
-    cfg = p / "config.json" if p.is_dir() else p.parent / "config.json"
-    try:
-        data = json.loads(cfg.read_text(encoding="utf-8"))
-        mt = str(data.get("model_type") or "").lower()
-        if mt == "whisper":
-            return "whisper"
-    except Exception:
-        pass
-    # Kokoro local checkouts have a `kokoro` substring in path or
-    # a `voices/` directory next to the .pth file.
-    name = str(p).lower()
-    if "kokoro" in name:
-        return "kokoro"
-    if p.is_dir() and (p / "voices").is_dir():
-        return "kokoro"
-    return ""
+def _detect_button(line_edit: QLineEdit, status_lbl: QLabel,
+                    default_model: str, *, modality: str,
+                    on_detected: Callable[[str], None] | None = None) -> QPushButton:
+    """`Detect` button that resolves the model id to a family via the
+    backend's family_detect module. `modality` ∈ {'stt', 'tts'}.
 
-
-def _hf_check_button(line_edit: QLineEdit, status_lbl: QLabel,
-                      default_model: str = "",
-                      family: str = "") -> QPushButton:
-    """`Check` button that pings huggingface.co/api/models/<id> or, if
-    the entered value looks like a local path, just checks existence.
-    Empty field → checks the built-in default.
-
-    If `family` is set ('whisper' / 'kokoro'), we also verify the model
-    belongs to that family. A mismatch turns the pill amber with the
-    detected family name in a tooltip — the engine would fail to load
-    a non-matching model, so this catches it before the user hits Load.
+    On click:
+      1. Read the model id (or fall back to `default_model`).
+      2. Hand off to family_detect.detect_*_family (local config.json
+         first, then HF metadata) in a worker thread.
+      3. Worker emits the Detected signal — the slot updates the
+         status pill on the Qt thread and fires the on_detected
+         callback so the card can rebuild its per-family widgets.
     """
-    from voxtype.qt_theme import OK, ERR, WARN
-    btn = QPushButton("Check")
+    from voxtype.backends import family_detect as fd
+    from voxtype.qt_theme import OK, WARN
+
+    btn = QPushButton("Detect")
     btn.setProperty("class", "ghost")
-    btn.setFixedWidth(58)
+    btn.setFixedWidth(62)
+    bridge = _DetectBridge(btn)   # parent → lives on Qt thread
 
     def _set(text: str, color: str, tip: str = "") -> None:
         status_lbl.setText(text)
         status_lbl.setStyleSheet(f"color: {color}; font-size: 11px;")
         status_lbl.setToolTip(tip)
 
-    async def _do_check() -> None:
-        from pathlib import Path
-        import aiohttp
-        text = (line_edit.text().strip() or default_model).strip()
-        if not text:
-            _set("(empty)", FG_MUTE)
-            return
-        # Local path? skip HF and just stat the file.
-        candidate = Path(text).expanduser()
-        if candidate.exists():
-            if not family:
-                _set("✓ local", OK)
-                return
-            detected = _local_family(candidate)
-            if detected == family:
-                _set(f"✓ local · {family}", OK)
-            elif detected:
-                _set(f"⚠ {detected} ≠ {family}", WARN,
-                     f"Local model looks like {detected!r}; this engine needs {family!r}.")
-            else:
-                _set("✓ local (?)", WARN,
-                     f"Could not detect family from local files. Engine expects {family!r}.")
-            return
-        _set("checking…", FG_MUTE)
-        # HF API uses GET — HEAD returns 401 even for public repos.
-        url = f"https://huggingface.co/api/models/{text.strip('/')}"
-        headers = {"User-Agent": "voxtype/1.0", "Accept": "application/json"}
-        try:
-            async with aiohttp.ClientSession(headers=headers) as sess:
-                async with sess.get(url, timeout=aiohttp.ClientTimeout(total=8),
-                                     allow_redirects=True) as resp:
-                    if resp.status == 200:
-                        if not family:
-                            _set("✓ found", OK)
-                            return
-                        try:
-                            meta = await resp.json(content_type=None)
-                        except Exception:
-                            meta = {}
-                        detected = _detect_family(meta or {}, text)
-                        if detected == family:
-                            _set(f"✓ {family}", OK,
-                                 f"Confirmed {family} family on HF.")
-                        elif detected:
-                            _set(f"⚠ {detected} ≠ {family}", WARN,
-                                 f"HF reports family={detected!r}; engine needs {family!r}. "
-                                 f"Loading will fail.")
-                        else:
-                            pt = (meta or {}).get("pipeline_tag") or "unknown"
-                            _set("⚠ wrong type", WARN,
-                                 f"Repo exists but isn't a {family} model "
-                                 f"(pipeline_tag={pt!r}). Engine will fail to load.")
-                    elif resp.status in (401, 403):
-                        _set("🔒 private", WARN)
-                    elif resp.status == 404:
-                        _set("✗ not found", ERR)
-                    else:
-                        _set(f"? {resp.status}", WARN)
-        except Exception:
-            _set("error", ERR)
+    def _on_done(fam: str, label: str) -> None:
+        if fam:
+            _set(f"✓ {label or fam}", OK, f"Detected family: {fam}")
+        else:
+            _set("⚠ unknown", WARN,
+                  "Couldn't detect family. The generic pipeline "
+                  "fallback will be used at load time.")
+        if on_detected is not None:
+            try:
+                on_detected(fam)
+            except Exception:
+                pass
+
+    bridge.done.connect(_on_done)
 
     def _on_click() -> None:
-        try:
-            loop = asyncio.get_event_loop()
-            if loop.is_running():
-                asyncio.ensure_future(_do_check())
-            else:
-                asyncio.run(_do_check())
-        except RuntimeError:
-            asyncio.run(_do_check())
+        from threading import Thread
+        model_id = (line_edit.text().strip() or default_model).strip()
+        if not model_id:
+            _set("(empty)", FG_MUTE)
+            return
+        _set("detecting…", FG_MUTE)
+
+        def _worker() -> None:
+            try:
+                if modality == "stt":
+                    fam = fd.detect_stt_family(model_id)
+                    label = fd.stt_family_label(fam) if fam else ""
+                else:
+                    fam = fd.detect_tts_family(model_id)
+                    label = fd.tts_family_label(fam) if fam else ""
+            except Exception as exc:
+                log.warning("detect failed for %r: %s", model_id, exc)
+                fam, label = "", ""
+            bridge.done.emit(fam or "", label or "")
+
+        Thread(target=_worker, daemon=True).start()
 
     btn.clicked.connect(_on_click)
     return btn
 
 
-def _model_row(path_field: str, default_model: str = "",
-                family: str = "") -> QWidget:
-    """Model path row: text field (HF repo OR local path) + Browse + Check + status pill.
+def _model_row(path_field: str, default_model: str, *,
+                modality: str,
+                on_detected: Callable[[str], None] | None = None) -> QWidget:
+    """Model row: [text field] [Browse] [Detect] [family status pill].
 
-    Same pattern as docgraph's reranker model row:
-      - Empty field → engine uses `default_model` automatically.
-      - Placeholder text shows the default so users know what they'll get.
-      - Free text accepts an HF repo ID or a local path.
-      - Browse picks a local model file.
-      - Check verifies the value (local stat first, then HF API). If
-        `family` is set ('whisper' / 'kokoro'), Check also validates that
-        the model belongs to that family — catches incompatible repos
-        before the engine's Load button fails.
-    """
+    Synchronous repo-id heuristic runs on every textChanged so the
+    family pill + Advanced widgets update instantly without waiting
+    for the user to click Detect (Detect is now the FULL HF-API check
+    for when the heuristic returns nothing)."""
     from PySide6.QtWidgets import QFileDialog
+    from voxtype.backends import family_detect as fd
+
     w = QWidget()
     h = QHBoxLayout(w); h.setContentsMargins(0, 0, 0, 0); h.setSpacing(6)
     le = QLineEdit()
@@ -528,25 +459,57 @@ def _model_row(path_field: str, default_model: str = "",
 
     def _on_browse() -> None:
         fn, _ = QFileDialog.getOpenFileName(
-            w, "Select ONNX model file", le.text() or "",
-            "ONNX models (*.onnx);;All files (*.*)",
+            w, "Select model file or directory", le.text() or "",
+            "All files (*.*)",
         )
         if fn:
             le.setText(fn)
             config.patch(path_field, fn)
+            _push_fast_detect(fn)
 
     browse.clicked.connect(_on_browse)
 
     status = QLabel("")
-    status.setMinimumWidth(86)
+    status.setMinimumWidth(160)
     status.setStyleSheet(f"color: {FG_MUTE}; font-size: 11px;")
-    le.textChanged.connect(lambda _t: (status.setText(""), None)[1])
-    check = _hf_check_button(le, status, default_model, family=family)
+
+    def _push_fast_detect(text: str) -> None:
+        """Cheap repo-id detection (no network). Fires the on_detected
+        callback so the card rebuilds family pill + voice picker."""
+        from voxtype.qt_theme import OK
+        text = (text or "").strip() or default_model
+        if not text:
+            return
+        if modality == "stt":
+            fam = fd.detect_stt_family_fast(text)
+            label = fd.stt_family_label(fam) if fam else ""
+        else:
+            fam = fd.detect_tts_family_fast(text)
+            label = fd.tts_family_label(fam) if fam else ""
+        if fam:
+            status.setText(f"✓ {label or fam}")
+            status.setStyleSheet(f"color: {OK}; font-size: 11px;")
+            status.setToolTip(f"Detected family: {fam}  (heuristic — "
+                                f"click Detect to verify against HuggingFace)")
+        else:
+            status.setText("")
+        if on_detected is not None:
+            try:
+                on_detected(fam or "")
+            except Exception:
+                pass
+
+    le.textChanged.connect(_push_fast_detect)
+    detect = _detect_button(le, status, default_model,
+                              modality=modality, on_detected=on_detected)
 
     h.addWidget(le, 1)
     h.addWidget(browse)
-    h.addWidget(check)
+    h.addWidget(detect)
     h.addWidget(status)
+
+    # Initial detect from saved/default value
+    _push_fast_detect(le.text())
     return w
 
 
@@ -646,6 +609,72 @@ def _server_status() -> tuple[str, str]:
     return ("running", "ok") if server.is_running() else ("stopped", "idle")
 
 
+# ── Spec-driven widget renderer ──────────────────────────────────────
+
+
+def _render_option(spec, bag_path: str) -> QWidget:
+    """Build a Qt widget from one OptionSpec. The widget reads its
+    initial value from `<bag_path>.<spec.key>` and writes back on
+    change via `config.patch()`. `bag_path` is "stt_opts" or
+    "tts_opts" — the per-family options dict."""
+    s = config.load()
+    bag = getattr(s, bag_path, {}) or {}
+    current = bag.get(spec.key, spec.default)
+    full_path = f"{bag_path}.{spec.key}"
+
+    if spec.kind == "bool":
+        w = QCheckBox(spec.label)
+        w.setChecked(bool(current))
+        w.toggled.connect(lambda v: config.patch(full_path, bool(v)))
+        return w
+    if spec.kind == "enum":
+        w = QComboBox()
+        for val, lbl in spec.choices:
+            w.addItem(lbl, val)
+        idx = next((i for i, (v, _) in enumerate(spec.choices)
+                     if v == current), 0)
+        w.setCurrentIndex(idx)
+        w.currentIndexChanged.connect(
+            lambda i: config.patch(full_path, w.itemData(i))
+        )
+        return w
+    if spec.kind == "int":
+        w = QSpinBox()
+        lo = int(spec.min if spec.min is not None else 0)
+        hi = int(spec.max if spec.max is not None else 100)
+        w.setRange(lo, hi)
+        w.setValue(int(current))
+        w.valueChanged.connect(lambda v: config.patch(full_path, int(v)))
+        return w
+    if spec.kind == "float":
+        from PySide6.QtWidgets import QSlider
+        wrap = QWidget()
+        layout = QHBoxLayout(wrap)
+        layout.setContentsMargins(0, 0, 0, 0); layout.setSpacing(10)
+        lo = float(spec.min if spec.min is not None else 0.0)
+        hi = float(spec.max if spec.max is not None else 1.0)
+        step = float(spec.step if spec.step is not None else 0.1)
+        slider = QSlider(Qt.Orientation.Horizontal)
+        n = max(1, int(round((hi - lo) / step)))
+        slider.setRange(0, n)
+        cur = float(current)
+        slider.setValue(int(round((cur - lo) / step)))
+        readout = QLabel(f"{cur:.2f}")
+        readout.setStyleSheet(f"color: {FG_DIM}; font-size: 11px; min-width: 52px;")
+        def _on(i: int) -> None:
+            val = round(lo + i * step, 4)
+            readout.setText(f"{val:.2f}")
+            config.patch(full_path, float(val))
+        slider.valueChanged.connect(_on)
+        layout.addWidget(slider, 1); layout.addWidget(readout)
+        return wrap
+    # "str" / "text" / unknown → text field
+    w = QLineEdit()
+    w.setText(str(current or ""))
+    w.editingFinished.connect(lambda: config.patch(full_path, w.text()))
+    return w
+
+
 def _build_services(window) -> QWidget:
     scroll, _, layout = _page()
 
@@ -667,158 +696,355 @@ def _build_services(window) -> QWidget:
     ))
     layout.addWidget(srv_card)
 
-    # ── STT card ───────────────────────────────────────────────────
-    from voxtype.stt_engine import available_backends as _stt_backends_fn
-    _stt_backends = _stt_backends_fn() or ["whisper"]
-    s_card, s_body = _card("STT", "pluggable speech-to-text · whisper")
-    s_body.addWidget(_row(_label("Backend",
-        "Engine library used for transcription. Currently ships `whisper` "
-        "(HuggingFace transformers). Additional backends slot in here as "
-        "they're added to voxtype/backends/."),
-        _combo("stt_backend", [(n, n) for n in _stt_backends])))
-    s_body.addWidget(_row(_label("Enabled"),
+    layout.addWidget(_build_stt_card(window))
+    layout.addWidget(_build_tts_card(window))
+    layout.addStretch(1)
+    return scroll
+
+
+def _build_stt_card(window) -> QWidget:
+    """STT card — single generic backend, auto-detects family.
+
+    Layout: lifecycle controls + model picker at the top; universal
+    knobs (language, device, dtype, warmup, torch.compile) in the
+    middle; family-specific "Advanced" widgets at the bottom, rebuilt
+    from the backend's `runtime_options()` whenever a family is
+    detected (either via Detect button or after Load completes)."""
+    from voxtype.backends import family_detect as fd
+    from voxtype.stt_engine import (
+        DEFAULT_MODEL as _STT_DEFAULT,
+        language_combo_options as _stt_langs,
+        all_language_codes as _stt_lang_codes,
+        get_engine as _stt_engine,
+    )
+
+    card, body = _card("STT", "speech-to-text · auto-detects family")
+    body.addWidget(_row(_label("Enabled"),
         _checkbox("stt_enabled", "Run STT")))
-    s_body.addWidget(_row(_label("Auto-Start On Boot",
+    body.addWidget(_row(_label("Auto-Start On Boot",
         "If off (default), the model loads on the first hotkey press. "
         "Turn on only if the first-transcribe warmup delay matters."),
         _checkbox("stt_auto_start", "Enabled")))
-    s_body.addWidget(_row(_label("Idle Unload",
+    body.addWidget(_row(_label("Idle Unload",
         "Unload the STT model after N seconds of no transcribe "
-        "requests. 0 = never. Next request reloads it automatically."),
+        "requests. 0 = never."),
         _spin_idle("stt_idle_unload_sec")))
-    from voxtype.stt_engine import DEFAULT_MODEL as _STT_DEFAULT
-    s_body.addWidget(_row(_label("Model",
-        "HuggingFace repo ID (auto-downloaded) or local path to a "
-        "Whisper-family model. Empty = use the built-in default "
-        "shown as placeholder."),
-        _model_row("stt_model_path", _STT_DEFAULT, family="whisper")))
-    s_body.addWidget(_row(_label("Device",
+
+    # ── Advanced container (rebuilt on family change) ────────────────
+    adv_widget = QWidget()
+    adv_layout = QVBoxLayout(adv_widget)
+    adv_layout.setContentsMargins(0, 0, 0, 0); adv_layout.setSpacing(10)
+
+    # The widgets below are rebuilt on family change. We track them so
+    # they can be removed and re-added.
+    state: dict = {"adv_rows": [], "current_family": ""}
+
+    def _rebuild_advanced(family: str) -> None:
+        """Tear down family-specific Advanced widgets and rebuild from
+        the backend's runtime_options() spec for the new family.
+        Family pill itself is handled inline in the model row."""
+        # Remove old rows
+        for row in state["adv_rows"]:
+            adv_layout.removeWidget(row)
+            row.deleteLater()
+        state["adv_rows"] = []
+        state["current_family"] = family
+        # Build new rows from spec
+        specs = fd.stt_runtime_options(family) if family else []
+        for spec in specs:
+            widget = _render_option(spec, "stt_opts")
+            row = _row(_label(spec.label, spec.help), widget)
+            adv_layout.addWidget(row)
+            state["adv_rows"].append(row)
+        # Toggle visibility of the universal language picker by
+        # multilingual capability.
+        caps = fd.stt_capabilities(family) if family else set()
+        nonlocal_lang = state.get("lang_row")
+        if nonlocal_lang is not None:
+            nonlocal_lang.setVisible("multilingual" in caps or not family)
+        # Dtype row visibility
+        dtype_row = state.get("dtype_row")
+        if dtype_row is not None:
+            dtype_row.setVisible("dtype" in caps or not family)
+        compile_row = state.get("compile_row")
+        if compile_row is not None:
+            compile_row.setVisible("torch_compile" in caps or not family)
+
+    # Model field with Detect callback that rebuilds advanced widgets.
+    body.addWidget(_row(_label("Model",
+        "HuggingFace repo ID (auto-downloaded) or local path. Paste "
+        "anything — Whisper, Wav2Vec2, MMS, Seamless, Moonshine, "
+        "SpeechT5, … — the family is auto-detected. Empty = use the "
+        "built-in default shown as placeholder."),
+        _model_row("stt_model_path", _STT_DEFAULT,
+                    modality="stt", on_detected=_rebuild_advanced)))
+
+    body.addWidget(_row(_label("Device",
         "Falls back to CPU automatically if torch.cuda.is_available() is False."),
         _combo("stt_device", [("cpu", "CPU"), ("cuda", "GPU (CUDA)")])))
-    from voxtype.stt_engine import (
-        language_combo_options as _stt_langs,
-        all_language_codes as _stt_lang_codes,
-    )
-    # Self-heal stale or typo'd values (e.g. an old "en-US" that Whisper
-    # would reject) by snapping them to "en" before showing the combo.
+
+    # Language — universal, but hidden for single-lang families
     if str(getattr(config.load(), "stt_language", "")) not in _stt_lang_codes():
         config.patch("stt_language", "en")
-    s_body.addWidget(_row(_label("Language",
-        "Whisper decoder hint. Pick `Auto-detect` to let Whisper guess "
-        "from audio (slightly slower; can mis-detect short clips). "
-        "Otherwise pick the language you'll be speaking."),
-        _combo("stt_language", _stt_langs())))
-    s_body.addWidget(_row(_label("Task",
-        "transcribe = output source language. translate = output English "
-        "regardless of source (Whisper's built-in translation mode)."),
-        _combo("stt_task", [("transcribe", "Transcribe"), ("translate", "Translate → EN")])))
-    s_body.addWidget(_row(_label("Precision",
+    lang_row = _row(_label("Language",
+        "Decoder hint for multilingual models (Whisper, MMS, Seamless). "
+        "Auto-detect lets Whisper guess. Single-language families "
+        "ignore this field."),
+        _combo("stt_language", _stt_langs()))
+    body.addWidget(lang_row); state["lang_row"] = lang_row
+
+    # Precision — gated by supports("dtype")
+    dtype_row = _row(_label("Precision",
         "Inference dtype. auto = fp16 on GPU, fp32 on CPU. bf16 needs "
-        "Ampere+ (RTX 30xx / A100+) — same speed as fp16, wider numeric "
-        "range. fp32 is the slowest but most accurate."),
+        "Ampere+ (RTX 30xx / A100+)."),
         _combo("stt_dtype", [
             ("auto", "Auto"), ("fp16", "fp16 (GPU fast)"),
             ("bf16", "bf16 (Ampere+)"), ("fp32", "fp32 (accurate)"),
-        ])))
-    s_body.addWidget(_row(_label("Beams",
-        "Beam-search width. 1 = greedy decoding, fastest. Higher = lower "
-        "WER but ~N× slower. Stick to 1 for live dictation."),
-        _spin("stt_num_beams", 1, 10)))
-    s_body.addWidget(_row(_label("Initial Prompt",
-        "Free text fed to the decoder to bias decoding. Useful for "
-        "jargon / acronyms / proper names (e.g. \"VoxType, telecode, "
-        "RouteMagic\"). Empty = no bias."),
-        _line_edit("stt_initial_prompt")))
-    s_body.addWidget(_row(_label("Warm Up On Load",
-        "Run a dummy 1-second inference right after the model loads so "
-        "the FIRST real hotkey press isn't slow (CUDA kernel autotune, "
-        "lazy weight materialisation)."),
+        ]))
+    body.addWidget(dtype_row); state["dtype_row"] = dtype_row
+
+    # ── Advanced (per-family) ────────────────────────────────────────
+    body.addWidget(QLabel(""))  # spacer
+    adv_header = QLabel("Advanced (per-family)")
+    adv_header.setStyleSheet(f"color: {FG_MUTE}; font-size: 11px; "
+                              f"text-transform: uppercase; letter-spacing: 1px;")
+    body.addWidget(adv_header)
+    body.addWidget(adv_widget)
+
+    body.addWidget(_row(_label("Warm Up On Load",
+        "Run a dummy inference after load so the FIRST real call "
+        "isn't slow."),
         _checkbox("stt_warmup", "Enabled")))
-    s_body.addWidget(_row(_label("torch.compile",
+
+    compile_row = _row(_label("torch.compile",
         "JIT-compile the model for ~20-40% steady-state speedup. Adds "
         "~30 s to the FIRST inference (one-time compile). Leave off "
         "unless you transcribe constantly."),
-        _checkbox("stt_torch_compile", "Enabled")))
-    s_body.addWidget(_lifecycle_row(
+        _checkbox("stt_torch_compile", "Enabled"))
+    body.addWidget(compile_row); state["compile_row"] = compile_row
+
+    body.addWidget(_lifecycle_row(
         "Load", "Unload", "Reload",
         on_load=lambda: window.start_service("stt"),
         on_unload=lambda: window.stop_service("stt"),
         on_reload=lambda: window.restart_service("stt"),
         status_getter=lambda: _engine_status("stt"),
     ))
-    layout.addWidget(s_card)
 
-    # ── TTS card ───────────────────────────────────────────────────
-    from voxtype.tts_engine import available_backends as _tts_backends_fn
-    _tts_backends = _tts_backends_fn() or ["kokoro"]
-    t_card, t_body = _card("TTS", "pluggable text-to-speech · kokoro")
-    t_body.addWidget(_row(_label("Backend",
-        "Engine library used for synthesis. Currently ships `kokoro` "
-        "(Kokoro-82M, 54 voices across 9 languages). Additional backends "
-        "slot in here as they're added to voxtype/backends/."),
-        _combo("tts_backend", [(n, n) for n in _tts_backends])))
-    t_body.addWidget(_row(_label("Enabled"),
+    # ── Initial state ───────────────────────────────────────────────
+    # Two sources: synchronous repo-id heuristic on the saved/default
+    # model id (no network), then live engine.get_backend() for the
+    # case where the model is already loaded with a confirmed family.
+    _initial = (str(getattr(config.load(), "stt_model_path", ""))
+                  or _STT_DEFAULT)
+    _initial_fam = fd.detect_stt_family_fast(_initial)
+    if _initial_fam:
+        _rebuild_advanced(_initial_fam)
+
+    def _poll_family() -> None:
+        """Catch the family the engine confirms after a successful Load.
+        Engine status callbacks fire on the executor thread; touching
+        Qt widgets from there is unsafe, so we poll instead."""
+        try:
+            be = _stt_engine().get_backend()
+            fam = be.detected_family() if be is not None else ""
+            if fam and fam != state.get("current_family"):
+                _rebuild_advanced(fam)
+        except Exception:
+            pass
+
+    poll = QTimer(card)
+    poll.setInterval(1500)
+    poll.timeout.connect(_poll_family)
+    poll.start()
+
+    return card
+
+
+def _build_tts_card(window) -> QWidget:
+    """TTS card — single generic backend, auto-detects family."""
+    from voxtype.backends import family_detect as fd
+    from voxtype.tts_engine import (
+        DEFAULT_MODEL as _TTS_DEFAULT,
+        get_engine as _tts_engine,
+    )
+
+    card, body = _card("TTS", "text-to-speech · auto-detects family")
+    body.addWidget(_row(_label("Enabled"),
         _checkbox("tts_enabled", "Run TTS")))
-    t_body.addWidget(_row(_label("Auto-Start On Boot"),
+    body.addWidget(_row(_label("Auto-Start On Boot"),
         _checkbox("tts_auto_start", "Enabled")))
-    t_body.addWidget(_row(_label("Idle Unload",
+    body.addWidget(_row(_label("Idle Unload",
         "Unload the TTS model after N seconds of no synthesise calls. "
         "0 = never."),
         _spin_idle("tts_idle_unload_sec")))
-    from voxtype.tts_engine import default_model_for as _tts_default_model_for
-    _tts_active_backend = str(getattr(config.load(), "tts_backend", "kokoro") or "kokoro")
-    _TTS_DEFAULT = _tts_default_model_for(_tts_active_backend)
-    t_body.addWidget(_row(_label("Model",
-        "HuggingFace repo ID (Kokoro) or backend-specific identifier "
-        "(Piper). Empty = use the built-in default shown as placeholder."),
+
+    # Per-family Advanced container
+    adv_widget = QWidget()
+    adv_layout = QVBoxLayout(adv_widget)
+    adv_layout.setContentsMargins(0, 0, 0, 0); adv_layout.setSpacing(10)
+
+    state: dict = {"adv_rows": [], "current_family": ""}
+
+    # Voice + speed widgets need to be rebuilt too — voice catalog
+    # depends on the family.
+    voice_row_holder = QWidget()
+    voice_row_layout = QVBoxLayout(voice_row_holder)
+    voice_row_layout.setContentsMargins(0, 0, 0, 0); voice_row_layout.setSpacing(0)
+
+    def _rebuild_voice_picker(family: str) -> None:
+        """Rebuild the voice combo. Static catalogs in family_detect
+        cover Kokoro (54 voices), Bark (preset speakers), Parler
+        (style presets), and SpeechT5 (default x-vectors) — no engine
+        load required. Families with implicit voices (VITS) or no
+        catalog (generic fallback) get a free-text input."""
+        # Clear holder
+        while voice_row_layout.count():
+            child = voice_row_layout.takeAt(0).widget()
+            if child is not None:
+                child.deleteLater()
+        voices = fd.tts_voices_for_family(family) if family else []
+        # Fall through to the loaded backend's catalog if family
+        # doesn't have a static one (e.g. SpeechT5 voices the user
+        # added by typing).
+        if not voices:
+            from voxtype.tts_engine import get_engine as _eng
+            be = _eng().get_backend()
+            if be is not None:
+                voices = be.voices()
+        if voices:
+            opts = [(v.voice_id,
+                     f"{v.voice_id}  ·  {v.language} · "
+                     f"{v.gender or '—'} · {v.display_name}")
+                    for v in voices]
+            # Snap the saved value to the catalog default if it's not
+            # in the list — avoids the dropdown silently picking
+            # entry-0 with a mismatched stored value.
+            cur = str(getattr(config.load(), "tts_voice", "") or "")
+            if cur not in {v.voice_id for v in voices}:
+                config.patch("tts_voice", voices[0].voice_id)
+            combo = _combo("tts_voice", opts)
+            new_row = _row(_label("Voice",
+                "Voice catalog from the detected family."),
+                combo)
+        else:
+            # Unknown family or no static catalog — text field.
+            le = _line_edit("tts_voice")
+            new_row = _row(_label("Voice",
+                "Voice id. Pick a model with a known catalog "
+                "(Kokoro / Bark / Parler / SpeechT5) or type a "
+                "backend-specific voice."),
+                le)
+        voice_row_layout.addWidget(new_row)
+
+    def _rebuild_advanced(family: str) -> None:
+        # Family pill itself is handled inline in the model row.
+        # Tear down old rows
+        for row in state["adv_rows"]:
+            adv_layout.removeWidget(row)
+            row.deleteLater()
+        state["adv_rows"] = []
+        state["current_family"] = family
+        # Build new
+        specs = fd.tts_runtime_options(family) if family else []
+        for spec in specs:
+            widget = _render_option(spec, "tts_opts")
+            row = _row(_label(spec.label, spec.help), widget)
+            adv_layout.addWidget(row)
+            state["adv_rows"].append(row)
+        # Universal-gated visibility
+        caps = fd.tts_capabilities(family) if family else set()
+        speed_row = state.get("speed_row")
+        if speed_row is not None:
+            speed_row.setVisible("speed" in caps or not family)
+        stream_row = state.get("stream_row")
+        if stream_row is not None:
+            stream_row.setVisible("stream" in caps or not family)
+        compile_row = state.get("compile_row")
+        if compile_row is not None:
+            compile_row.setVisible("torch_compile" in caps or not family)
+        # Rebuild voice picker — catalog may have changed.
+        _rebuild_voice_picker(family)
+
+    body.addWidget(_row(_label("Model",
+        "HuggingFace repo ID (auto-downloaded) or local path. Paste "
+        "anything — Kokoro, MMS-TTS, SpeechT5, Bark, Parler, … — the "
+        "family is auto-detected."),
         _model_row("tts_model_path", _TTS_DEFAULT,
-                    family=_tts_active_backend)))
-    t_body.addWidget(_row(_label("Device",
+                    modality="tts", on_detected=_rebuild_advanced)))
+
+    body.addWidget(_row(_label("Device",
         "Falls back to CPU automatically if torch.cuda.is_available() is False."),
         _combo("tts_device", [("cpu", "CPU"), ("cuda", "GPU (CUDA)")])))
-    from voxtype.tts_engine import (
-        voice_combo_options as _tts_voices,
-        all_voice_ids as _tts_voice_ids,
-        default_voice_for as _tts_default_voice_for,
-    )
-    # Migrate legacy / cross-backend voice values. If the current
-    # tts_speaker isn't in the active backend's catalog, snap to that
-    # backend's default voice.
-    _active_voice_ids = _tts_voice_ids(_tts_active_backend)
-    _active_default_voice = _tts_default_voice_for(_tts_active_backend)
-    if str(getattr(config.load(), "tts_speaker", "")) not in _active_voice_ids:
-        config.patch("tts_speaker", _active_default_voice)
-    t_body.addWidget(_row(_label("Voice",
-        "Voice catalog for the active backend. Kokoro: 54 voices across "
-        "9 languages (a/b=Am/Br-En, e=es, f=fr, h=hi, i=it, j=ja, "
-        "p=pt-br, z=zh; second letter f=female, m=male)."),
-        _combo("tts_speaker", _tts_voices(_tts_active_backend))))
-    t_body.addWidget(_row(_label("Speed",
+
+    # Voice (rebuilds with family — initial state populated by the
+    # final detect-from-saved-model pass at the bottom of the card)
+    body.addWidget(voice_row_holder)
+
+    # Speed (universal-gated)
+    speed_row = _row(_label("Speed",
         "Synthesis rate. 1.0 = normal, >1 = faster, <1 = slower."),
-        _slider_float("tts_length_scale", 0.5, 2.0, 0.05, suffix="x")))
-    t_body.addWidget(_row(_label("Stream Audio",
-        "Reply with chunked WAV — first audio plays in ~200 ms instead "
-        "of waiting for the whole utterance. Big TTFB win for long text."),
-        _checkbox("tts_stream", "Enabled")))
-    t_body.addWidget(_row(_label("Warm Up On Load",
-        "Run a dummy synth right after the pipeline loads so the FIRST "
-        "real /v1/audio/speech call isn't slow."),
+        _slider_float("tts_speed", 0.5, 2.0, 0.05, suffix="x"))
+    body.addWidget(speed_row); state["speed_row"] = speed_row
+
+    # ── Advanced ────────────────────────────────────────────────────
+    body.addWidget(QLabel(""))
+    adv_header = QLabel("Advanced (per-family)")
+    adv_header.setStyleSheet(f"color: {FG_MUTE}; font-size: 11px; "
+                              f"text-transform: uppercase; letter-spacing: 1px;")
+    body.addWidget(adv_header)
+    body.addWidget(adv_widget)
+
+    stream_row = _row(_label("Stream Audio",
+        "Reply with chunked WAV — first audio plays in ~200 ms. "
+        "Only honoured by backends that support streaming (Kokoro)."),
+        _checkbox("tts_stream", "Enabled"))
+    body.addWidget(stream_row); state["stream_row"] = stream_row
+
+    body.addWidget(_row(_label("Warm Up On Load",
+        "Run a dummy synth after the pipeline loads so the FIRST "
+        "real call isn't slow."),
         _checkbox("tts_warmup", "Enabled")))
-    t_body.addWidget(_row(_label("torch.compile",
-        "JIT-compile the Kokoro model. ~15% steady-state speedup with a "
-        "shorter first-call penalty than Whisper (Kokoro is only 82M)."),
-        _checkbox("tts_torch_compile", "Enabled")))
-    t_body.addWidget(_lifecycle_row(
+
+    compile_row = _row(_label("torch.compile",
+        "JIT-compile the model for steady-state speedup."),
+        _checkbox("tts_torch_compile", "Enabled"))
+    body.addWidget(compile_row); state["compile_row"] = compile_row
+
+    body.addWidget(_lifecycle_row(
         "Load", "Unload", "Reload",
         on_load=lambda: window.start_service("tts"),
         on_unload=lambda: window.stop_service("tts"),
         on_reload=lambda: window.restart_service("tts"),
         status_getter=lambda: _engine_status("tts"),
     ))
-    layout.addWidget(t_card)
 
-    layout.addStretch(1)
-    return scroll
+    # Initial detect from saved/default model id (cheap, no network).
+    _initial = (str(getattr(config.load(), "tts_model_path", ""))
+                  or _TTS_DEFAULT)
+    _initial_fam = fd.detect_tts_family_fast(_initial)
+    if _initial_fam:
+        _rebuild_advanced(_initial_fam)
+    else:
+        # No family detected yet → render a plain text input so the
+        # Voice row isn't blank.
+        _rebuild_voice_picker("")
+
+    def _poll_family() -> None:
+        try:
+            be = _tts_engine().get_backend()
+            fam = be.detected_family() if be is not None else ""
+            if fam and fam != state.get("current_family"):
+                _rebuild_advanced(fam)
+        except Exception:
+            pass
+
+    poll = QTimer(card)
+    poll.setInterval(1500)
+    poll.timeout.connect(_poll_family)
+    poll.start()
+
+    return card
 
 
 def _build_llm(window) -> QWidget:

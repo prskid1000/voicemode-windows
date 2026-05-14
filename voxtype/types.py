@@ -3,38 +3,51 @@
 STT and TTS both run in-process via PyTorch. An embedded HTTP server
 (single port, default 6600) exposes them to external clients via
 OpenAI-compatible endpoints — see voxtype/server.py.
+
+Architecture: one generic STT backend and one generic TTS backend
+auto-dispatch by HuggingFace `config.json` model_type / pipeline_tag
+to the right handler (Whisper, Wav2Vec2, MMS, Seamless, Moonshine,
+Kokoro, VITS, SpeechT5, Bark, Parler, …). Per-family knobs live in
+the free-form `stt_opts` / `tts_opts` dicts so the UI can render
+them dynamically without AppSettings ever needing to know about
+family-specific fields.
 """
 from __future__ import annotations
 
 from dataclasses import dataclass, field, asdict
-from typing import Literal
+from typing import Any, Literal
 
 PillState = Literal["idle", "recording", "processing", "enhancing", "typing", "error"]
 HotkeyMode = Literal["hold", "toggle"]
 # torch device preference. Used by both STT and TTS engines.
 TorchDevice = Literal["cpu", "cuda"]
-# Pluggable engine backend names. Real list comes from
-# voxtype.backends.{stt,tts}_backend_names() at runtime — these literals
-# are just for type-hint clarity. New entries land here whenever
-# additional backends are registered in voxtype/backends/__init__.py.
-STTBackendName = Literal["whisper"]
-TTSBackendName = Literal["kokoro"]
 # Inference precision. `auto` = fp16 on CUDA, fp32 on CPU. `bf16` needs
 # Ampere+ (RTX 30xx / A100+) — same speed as fp16, wider numeric range.
 TorchDtype = Literal["auto", "fp32", "fp16", "bf16"]
-# Whisper task. `translate` outputs English regardless of source language.
-STTTask = Literal["transcribe", "translate"]
 
 
 @dataclass
 class HotkeyCombo:
     """One or two keys that must be held together to activate the hotkey.
 
-    Keys use pynput-style string names (e.g. "ctrl", "cmd", "f9") so we don't
-    carry the Windows/uiohook numeric keycode over. `label` is human-readable."""
+    Keys use pynput-style string names (e.g. "ctrl", "cmd", "f9") so we
+    don't carry the Windows/uiohook numeric keycode over. `label` is
+    human-readable."""
     key1: str = "ctrl"
     key2: str | None = "cmd"
     label: str = "Ctrl + Win"
+
+
+# Old top-level keys → new opts-bag keys. Read on settings load to
+# migrate existing settings.json files without dropping user prefs.
+_STT_OPTS_MIGRATIONS: dict[str, str] = {
+    "stt_task":            "task",
+    "stt_num_beams":       "num_beams",
+    "stt_initial_prompt":  "initial_prompt",
+}
+_TTS_OPTS_MIGRATIONS: dict[str, str] = {
+    "tts_length_scale":    "speed",
+}
 
 
 @dataclass
@@ -43,8 +56,7 @@ class AppSettings:
     hotkey_mode: HotkeyMode = "hold"
     hotkey: HotkeyCombo = field(default_factory=HotkeyCombo)
     auto_stop_on_silence: bool = True
-    silence_duration_sec: float = 1.5   # seconds of continuous silence
-                                         # before the recorder auto-stops
+    silence_duration_sec: float = 1.5
     vad_enabled: bool = True
     append_mode: bool = False
 
@@ -53,70 +65,52 @@ class AppSettings:
     pill_y: int = -1
     pill_hidden: bool = False
 
-    # ── Embedded HTTP server (serves both STT + TTS) ─────────────────
-    # Default 6600 — external clients reach VoxType through this port
-    # via OpenAI-compatible routes.
+    # ── Embedded HTTP server ─────────────────────────────────────────
     server_enabled: bool = True
     server_port: int = 6600
 
     # ── STT (in-process via transformers + torch) ───────────────────
     # `stt_model_path` accepts a HF repo ID (auto-downloaded) or a local
-    # path. Default = `openai/whisper-base`: 99-language multilingual,
-    # ~145 MB on disk. Any HF Whisper-family repo works (distilled,
-    # large, fine-tunes). Empty field falls back to DEFAULT_MODEL in
-    # stt_engine.
+    # path. Paste anything — Whisper, Wav2Vec2, HuBERT, MMS, Seamless,
+    # Moonshine, SpeechT5 — the generic backend sniffs the model's
+    # config.json and picks the right loader.
     stt_enabled: bool = True
     stt_auto_start: bool = True
     stt_idle_unload_sec: int = 300
-    # Pluggable backend. "whisper" = HuggingFace transformers (default,
-    # broadest feature set). "faster-whisper" = CTranslate2, ~4× faster
-    # on GPU with int8 CPU mode.
-    stt_backend: STTBackendName = "whisper"
+    stt_backend: str = "generic"             # always "generic" in normal use
     stt_model_path: str = "openai/whisper-base"
     stt_device: TorchDevice = "cpu"
-    stt_language: str = "en"
-    # Whisper task. `translate` → English; `transcribe` → source language.
-    stt_task: STTTask = "transcribe"
-    # Override torch dtype. `auto` picks fp16/CUDA, fp32/CPU.
+    stt_language: str = "en"                  # universal — every multilingual
+                                              # family honours it
     stt_dtype: TorchDtype = "auto"
-    # Beam-search width. 1 = greedy (fastest). Higher = slower but lower WER.
-    stt_num_beams: int = 1
-    # Domain-bias prompt fed to the decoder (jargon, names, codes).
-    stt_initial_prompt: str = ""
-    # Run a dummy 1-sec inference right after load so the FIRST real
-    # hotkey press isn't slow (CUDA kernel autotune, etc.).
     stt_warmup: bool = True
-    # torch.compile(model) after load. ~20-40% steady-state speedup, but
-    # adds ~30 s to the first inference (one-time JIT) and can break with
-    # exotic models. Safe to leave off unless you transcribe constantly.
     stt_torch_compile: bool = False
+    # Family-specific per-call options. Populated by the UI from the
+    # active backend's runtime_options() spec list. Keys depend on the
+    # detected family — Whisper writes `task`, `num_beams`,
+    # `initial_prompt`; Bark writes `temperature`; Parler writes
+    # `style`; etc.
+    stt_opts: dict[str, Any] = field(default_factory=dict)
 
-    # ── TTS (in-process via kokoro PyPI package + torch) ────────────
-    # `tts_model_path` accepts a HF repo ID. Default = `hexgrad/Kokoro-82M`:
-    # 54 voices across 9 language families (American + British English,
-    # Spanish, French, Hindi, Italian, Japanese, Brazilian Portuguese,
-    # Mandarin Chinese), ~327 MB on disk.
-    # `tts_speaker` is a voice NAME (string), not an index. Examples:
-    #   af_heart, am_adam, bf_emma, bm_george, jm_kumo, zf_xiaobei.
+    # ── TTS (in-process via torch + assorted model libs) ────────────
+    # `tts_model_path` accepts any HF repo (Kokoro, MMS-TTS, SpeechT5,
+    # Bark, Parler) or a local path. Voice list is rebuilt per-backend.
     tts_enabled: bool = False
     tts_auto_start: bool = False
     tts_idle_unload_sec: int = 600
-    # Pluggable backend. "kokoro" = official kokoro PyTorch (default,
-    # 54 voices, 9 langs). "piper" = ONNX-based, ~150 voices in 30+ langs,
-    # tiny memory footprint.
-    tts_backend: TTSBackendName = "kokoro"
+    tts_backend: str = "generic"
     tts_model_path: str = "hexgrad/Kokoro-82M"
     tts_device: TorchDevice = "cpu"
-    tts_speaker: str = "af_heart"
-    tts_length_scale: float = 1.0      # Kokoro `speed` arg (1.0 = normal)
-    # First-call warmup — same idea as STT.
+    tts_voice: str = "af_heart"               # universal — every backend
+                                              # picks a voice some way
+    tts_speed: float = 1.0                    # universal-gated (suppressed
+                                              # for backends without speed)
     tts_warmup: bool = True
-    # torch.compile(model) — Kokoro is small so the win is smaller (~15%)
-    # but the first-synth penalty is also lower.
     tts_torch_compile: bool = False
-    # Stream WAV chunks back as Kokoro yields per-sentence audio.
-    # Drops time-to-first-audio from ~full utterance to ~200 ms.
     tts_stream: bool = False
+    # Family-specific per-call options (style prompt for Parler,
+    # speaker_embedding for SpeechT5, temperature for Bark, etc.).
+    tts_opts: dict[str, Any] = field(default_factory=dict)
 
     # ── LLM enhancement (via telecode proxy) ─────────────────────────
     enhance_enabled: bool = True
@@ -128,6 +122,7 @@ class AppSettings:
     save_history: bool = True
 
     # ── Serialization helpers ────────────────────────────────────────
+
     def to_json(self) -> dict:
         return asdict(self)
 
@@ -141,12 +136,37 @@ class AppSettings:
                 label=hk.get("label", "Ctrl + Win"),
             ),
         )
-        # Copy remaining fields (skip hotkey — handled above)
+        # Apply known fields first.
         for key, value in d.items():
             if key == "hotkey":
                 continue
             if hasattr(settings, key):
                 setattr(settings, key, value)
+
+        # ── Migrations from the pre-opts-bag schema ──────────────────
+        # Family-specific STT fields → stt_opts.
+        for old_key, new_key in _STT_OPTS_MIGRATIONS.items():
+            if old_key in d and new_key not in settings.stt_opts:
+                settings.stt_opts[new_key] = d[old_key]
+        # Family-specific TTS fields → tts_opts.
+        for old_key, new_key in _TTS_OPTS_MIGRATIONS.items():
+            if old_key in d and new_key not in settings.tts_opts:
+                settings.tts_opts[new_key] = d[old_key]
+        # Voice key rename: tts_speaker → tts_voice.
+        if "tts_speaker" in d and not d.get("tts_voice"):
+            settings.tts_voice = str(d["tts_speaker"] or "af_heart")
+        # tts_length_scale → tts_speed (top-level).
+        if "tts_length_scale" in d and "tts_speed" not in d:
+            try:
+                settings.tts_speed = float(d["tts_length_scale"] or 1.0)
+            except (TypeError, ValueError):
+                pass
+        # Old backend names (`whisper`, `kokoro`) → `generic`. The new
+        # backend covers them via family detection.
+        if settings.stt_backend not in {"generic"}:
+            settings.stt_backend = "generic"
+        if settings.tts_backend not in {"generic"}:
+            settings.tts_backend = "generic"
         return settings
 
 

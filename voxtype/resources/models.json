@@ -1,0 +1,35 @@
+{
+  "_comment": "Curated model aliases — friendly names → HF repo ids. Loaded by the model picker on Settings open. Add your own entries; the format is { stt|tts: [{name, model, family?, default_opts?}, …] }.",
+  "stt": [
+    {"name": "Whisper Base (default)",       "model": "openai/whisper-base"},
+    {"name": "Whisper Small",                "model": "openai/whisper-small"},
+    {"name": "Whisper Medium",               "model": "openai/whisper-medium"},
+    {"name": "Whisper Large v3",             "model": "openai/whisper-large-v3"},
+    {"name": "Whisper Large v3 Turbo",       "model": "openai/whisper-large-v3-turbo"},
+    {"name": "Distil-Whisper Large v3",      "model": "distil-whisper/distil-large-v3"},
+    {"name": "Distil-Whisper Medium",        "model": "distil-whisper/distil-medium.en"},
+    {"name": "Moonshine Tiny (EN, fast)",    "model": "UsefulSensors/moonshine-tiny"},
+    {"name": "Moonshine Base (EN)",          "model": "UsefulSensors/moonshine-base"},
+    {"name": "Wav2Vec2 EN (CTC)",            "model": "facebook/wav2vec2-large-960h-lv60-self"},
+    {"name": "HuBERT Large EN",              "model": "facebook/hubert-large-ls960-ft"},
+    {"name": "MMS 1B All (1107 langs)",      "model": "facebook/mms-1b-all"},
+    {"name": "MMS 1B FL102",                 "model": "facebook/mms-1b-fl102"},
+    {"name": "SeamlessM4T v2 Large",         "model": "facebook/seamless-m4t-v2-large"},
+    {"name": "SeamlessM4T Medium",           "model": "facebook/hf-seamless-m4t-medium"},
+    {"name": "SpeechT5 ASR",                 "model": "microsoft/speecht5_asr"}
+  ],
+  "tts": [
+    {"name": "Kokoro 82M (default)",         "model": "hexgrad/Kokoro-82M",                 "default_voice": "af_heart"},
+    {"name": "MMS-TTS English",              "model": "facebook/mms-tts-eng"},
+    {"name": "MMS-TTS Spanish",              "model": "facebook/mms-tts-spa"},
+    {"name": "MMS-TTS French",               "model": "facebook/mms-tts-fra"},
+    {"name": "MMS-TTS Hindi",                "model": "facebook/mms-tts-hin"},
+    {"name": "MMS-TTS German",               "model": "facebook/mms-tts-deu"},
+    {"name": "MMS-TTS Mandarin",             "model": "facebook/mms-tts-cmn"},
+    {"name": "SpeechT5 TTS",                 "model": "microsoft/speecht5_tts",             "default_voice": "Matthijs/cmu-arctic-xvectors:7306"},
+    {"name": "Bark (small)",                 "model": "suno/bark-small",                    "default_voice": "v2/en_speaker_6"},
+    {"name": "Bark",                         "model": "suno/bark",                          "default_voice": "v2/en_speaker_6"},
+    {"name": "Parler Mini v1",               "model": "parler-tts/parler-tts-mini-v1",      "default_voice": "calm-male"},
+    {"name": "Parler Large v1",              "model": "parler-tts/parler-tts-large-v1",     "default_voice": "calm-male"}
+  ]
+}

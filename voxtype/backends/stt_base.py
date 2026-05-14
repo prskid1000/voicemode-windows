@@ -2,7 +2,7 @@
 
 The engine wrapper (`voxtype.stt_engine`) calls the methods on this
 ABC; each concrete backend implements them with its library of
-choice (transformers, faster-whisper, NeMo, etc.).
+choice (transformers, NeMo, faster-whisper, etc.).
 
 Threading: `load_sync()` and `transcribe_sync()` are CALLED from
 the engine's single-thread executor, so they MUST be blocking
@@ -12,7 +12,8 @@ the async glue.
 from __future__ import annotations
 
 from abc import ABC, abstractmethod
-from dataclasses import dataclass
+from dataclasses import dataclass, field
+from typing import Any
 
 
 @dataclass
@@ -26,12 +27,19 @@ class LoadConfig:
 
 
 @dataclass
-class TranscribeOptions:
-    """Bundle of per-call inference options."""
-    language: str          # ISO 639-1 code, or "auto"
-    task: str              # "transcribe" | "translate"
-    num_beams: int         # >=1; 1 = greedy
-    initial_prompt: str    # decoder bias text
+class OptionSpec:
+    """One UI option, declared by a backend. The settings window
+    renders a widget from this spec — no per-backend UI code needed."""
+    key: str                          # storage key inside opts dict
+    kind: str                         # "enum" | "bool" | "int" | "float" | "str" | "text"
+    label: str                        # row label
+    default: Any                      # initial value
+    help: str = ""                    # row help text under the label
+    choices: list[tuple[str, str]] = field(default_factory=list)  # for enum: (value, label)
+    min: float | None = None          # for int/float
+    max: float | None = None
+    step: float | None = None
+    rebuild: bool = False             # changing this forces engine reload
 
 
 class STTBackend(ABC):
@@ -39,17 +47,19 @@ class STTBackend(ABC):
 
     # ── Identity ─────────────────────────────────────────────────────
 
-    name: str = ""              # e.g. "whisper" / "faster-whisper"
+    name: str = ""              # registry key, e.g. "generic" / "whisper"
     default_model: str = ""     # model id to use when settings is empty
-    family_tags: tuple[str, ...] = ()
-    # Tags any HF model in this family should match (used by the Check
-    # button's family validator). Empty tuple = skip family check.
+    priority: int = 0           # higher = preferred when multiple backends
+                                # claim a model id. 100 = specialist,
+                                # 0 = universal fallback.
 
     # ── Catalog (UI introspection) ───────────────────────────────────
 
     def language_options(self) -> list[tuple[str, str]]:
-        """(code, label) tuples for a QComboBox. Override if the backend
-        supports a different set than Whisper's 99 + auto."""
+        """(code, label) tuples for the language picker. Default = the
+        Whisper 99-language table + Auto-detect. Backends that don't
+        support multilingual decoding should override to return their
+        single supported language (or `[]` to hide the picker)."""
         from voxtype.backends.shared import WHISPER_LANGUAGES
         return WHISPER_LANGUAGES
 
@@ -57,18 +67,30 @@ class STTBackend(ABC):
         return {c for c, _ in self.language_options()}
 
     def supports(self, feature: str) -> bool:
-        """UI capability flag. Features:
-          - "task_translate": Whisper-style translate-to-EN mode
-          - "initial_prompt": decoder bias text
-          - "num_beams": beam search width >1
-          - "torch_compile": torch.compile(model)
-          - "bf16": bfloat16 dtype
-        Override per backend; the base assumes Whisper-family capability set.
+        """UI capability flag. Recognised features:
+          - "dtype"           — `dtype` setting honoured
+          - "torch_compile"   — torch.compile(model) supported
+          - "multilingual"    — language picker meaningful
+          - "task_translate"  — Whisper-style translate-to-EN mode
+          - "initial_prompt"  — decoder bias text
+          - "num_beams"       — beam search width >1
+          - "bf16"            — bfloat16 dtype supported
+          - "streaming"       — partial transcripts via chunk feed
         """
-        return feature in {
-            "task_translate", "initial_prompt", "num_beams",
-            "torch_compile", "bf16",
-        }
+        return False
+
+    def load_options(self) -> list[OptionSpec]:
+        """Pre-load knobs that live above the [Load] button. Override
+        if you have backend-specific load-time knobs (most backends
+        don't — model/device/dtype are universal and live in
+        AppSettings as first-class fields)."""
+        return []
+
+    def runtime_options(self) -> list[OptionSpec]:
+        """Per-call knobs (language, beams, prompt, etc). The generic
+        backend returns family-specific specs after the model is loaded
+        and the family is known; before load it returns []."""
+        return []
 
     # ── Lifecycle ────────────────────────────────────────────────────
 
@@ -81,11 +103,23 @@ class STTBackend(ABC):
         """Drop weights + clear CUDA cache. Blocking."""
 
     @abstractmethod
-    def transcribe_sync(self, pcm: bytes, opts: TranscribeOptions) -> str:
-        """Transcribe 16 kHz mono int16 PCM. Blocking. Returns plain text."""
+    def transcribe_sync(self, pcm: bytes, opts: dict[str, Any]) -> str:
+        """Transcribe 16 kHz mono int16 PCM. Blocking. Returns plain text.
+
+        `opts` is the per-call dict from `AppSettings.stt_opts`.
+        Implementations read only the keys they understand and ignore
+        the rest, so adding a new family-specific option never breaks
+        other backends."""
 
     # ── Optional introspection (for status / diagnostics) ────────────
 
     def runtime_info(self) -> dict:
         """Free-form dict surfaced by /health and the tray pill."""
         return {}
+
+    def detected_family(self) -> str:
+        """Human-readable family identifier shown in the UI after load.
+        For the generic backend this is dynamic (e.g. "whisper",
+        "wav2vec2", "mms", "seamless"); single-family backends just
+        return their own name."""
+        return self.name

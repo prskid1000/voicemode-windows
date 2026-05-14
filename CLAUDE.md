@@ -6,62 +6,83 @@ User-facing docs: [README.md](README.md).
 
 VoxType is a **pure-Python / PySide6** voice-dictation overlay for
 Windows. Hold a hotkey, speak, release — the cleaned transcript is
-pasted at the cursor. STT and TTS both run **in-process via PyTorch**
-— one ML backend, one venv. STT uses HuggingFace `transformers` (any
-Whisper-family ONNX-exported repo or PyTorch repo works); TTS uses
-the `kokoro` PyPI package wrapping Kokoro-82M. An embedded aiohttp
-server exposes both on one OpenAI-compatible port (`:6600` by
-default) so external clients reach VoxType over standard HTTP.
+pasted at the cursor.
 
-LLM transcript cleanup is routed through
+STT and TTS both run **in-process via PyTorch through a single
+generic backend per modality**. Paste any HuggingFace repo id (or
+local path); the backend reads `config.json`, auto-detects the
+family, and dispatches to the right loader. One transformers
+install covers Whisper, Wav2Vec2, HuBERT, WavLM, MMS, SeamlessM4T,
+Moonshine, SpeechT5 (ASR + TTS), Bark, Parler-TTS, VITS / MMS-TTS,
+plus a `transformers.pipeline()` fallback for anything else HF
+registers as ASR / TTS.
+
+An embedded aiohttp server exposes both engines on one
+OpenAI-compatible port (`:6600` by default) so external clients reach
+VoxType over standard HTTP. LLM transcript cleanup is routed through
 **telecode's dual-protocol proxy** (`http://127.0.0.1:1235`).
 
 ## Project layout
 
 ```
 voxtype/
-├── setup.ps1                  # Idempotent installer: single venv + scheduled task
-├── uninstall.ps1              # Reverse of setup
-├── README.md                  # User-facing docs
-├── CLAUDE.md                  # This file
-├── LICENSE                    # MIT
-├── .gitignore
-└── voxtype/                   # The Python package
+├── setup.ps1                     # Idempotent installer
+├── uninstall.ps1                 # Reverse of setup
+├── README.md                     # User-facing docs
+├── CLAUDE.md                     # This file
+├── tests/                        # unittest-style tests, stdlib-only
+│   ├── _isolate.py               # per-test VOXTYPE_DATA_DIR sandbox
+│   ├── test_family_detect.py     # repo-id → family heuristics
+│   ├── test_settings_migration.py# AppSettings legacy-key migration
+│   ├── test_config_patch.py      # stt_opts.* / tts_opts.* dotted writes
+│   ├── test_backends_registry.py # registry returns generic backend
+│   ├── test_alias_catalog.py     # resources/models.json integrity
+│   └── test_engine_opts_filter.py# engine filters opts by spec
+└── voxtype/                      # The Python package
     ├── __init__.py
-    ├── __main__.py            # `python -m voxtype` entry point
-    ├── main.py                # Orchestrator (Qt loop + asyncio worker + pynput thread)
-    ├── types.py               # AppSettings / HotkeyCombo / PillState
-    ├── config.py              # JSON I/O (voxtype/data/settings.json, hot-reload)
-    ├── debug_log.py           # Rotating logger
+    ├── __main__.py               # `python -m voxtype` entry
+    ├── main.py                   # Qt loop + asyncio worker + pynput
+    ├── types.py                  # AppSettings (+ stt_opts/tts_opts)
+    ├── config.py                 # JSON I/O + dotted patch
+    ├── debug_log.py
     │
-    ├── audio.py               # sounddevice → 16 kHz mono int16 PCM
-    ├── hotkey.py              # pynput keyboard listener
-    ├── vad.py                 # numpy RMS energy gate on PCM
-    ├── screen_capture.py      # mss + PIL, red cursor marker
-    ├── typer.py               # Clipboard + Ctrl+V via PowerShell SendKeys
-    ├── history.py             # Append-only JSON
+    ├── audio.py                  # sounddevice → 16 kHz mono int16 PCM
+    ├── hotkey.py                 # pynput keyboard listener
+    ├── vad.py                    # numpy RMS energy gate
+    ├── screen_capture.py
+    ├── typer.py                  # Clipboard + Ctrl+V via SendKeys
+    ├── history.py
     │
-    ├── stt_engine.py          # transformers.WhisperForConditionalGeneration + torch
-    ├── tts_engine.py          # kokoro.KPipeline + torch
-    ├── server.py              # Embedded aiohttp /v1/audio/* server
-    ├── stt.py                 # Shim → delegates to stt_engine
-    ├── llm.py                 # OpenAI-shape POST to telecode proxy
-    ├── process.py             # Facade over engines for tray UI + Job Object utilities
+    ├── stt_engine.py             # STT orchestrator (lifecycle)
+    ├── tts_engine.py             # TTS orchestrator (lifecycle)
+    ├── server.py                 # Embedded aiohttp /v1/audio/* server
+    ├── stt.py                    # Shim → stt_engine
+    ├── llm.py                    # OpenAI-shape POST to telecode
+    ├── process.py                # Facade over engines for tray UI
     │
-    ├── qt_theme.py            # Dark QSS
-    ├── tray_menu.py           # QSystemTrayIcon + submenus (STT / TTS / LLM)
-    ├── pill_window.py         # Frameless always-on-top status pill
-    ├── settings_window.py     # Frameless sidebar settings window
+    ├── qt_theme.py               # Dark QSS
+    ├── tray_menu.py              # QSystemTrayIcon + submenus
+    ├── pill_window.py            # Frameless always-on-top status pill
+    ├── settings_window.py        # Spec-driven settings UI
     │
     ├── requirements.txt
     ├── resources/
     │   ├── icon.png
-    │   └── system-prompt.md   # LLM cleanup instructions
-    └── data/                  # User state — gitignored
-        ├── settings.json
-        ├── history.json
-        ├── voxtype.log
-        └── voxtype.log.prev
+    │   ├── system-prompt.md      # LLM cleanup instructions
+    │   └── models.json           # Curated friendly-name → repo-id catalog
+    ├── data/                     # User state — gitignored
+    │   ├── settings.json
+    │   ├── history.json
+    │   ├── voxtype.log
+    │   └── voxtype.log.prev
+    └── backends/
+        ├── __init__.py           # Registry — registers `generic` only
+        ├── stt_base.py           # STTBackend ABC + LoadConfig + OptionSpec
+        ├── tts_base.py           # TTSBackend ABC + TTSLoadConfig + OptionSpec + VoiceEntry
+        ├── shared.py             # Whisper 99-language table
+        ├── family_detect.py      # Family detection + per-family options + voice catalogs
+        ├── generic_stt.py        # The one STT backend; dispatches to family handlers
+        └── generic_tts.py        # The one TTS backend; dispatches to family handlers
 ```
 
 ## Runtime architecture
@@ -74,77 +95,147 @@ voxtype-tts          single-thread executor — torch TTS synthesis
 pynput thread        raw keyboard hook
 ```
 
-Cross-thread handoff is Qt signals (pill state) or
+Cross-thread handoff uses Qt signals (pill state) or
 `QTimer.singleShot(0, lambda: …)` (pulling async results back to the
 Qt thread).
 
-## Pluggable engine backends
+Engine status callbacks fire on the executor thread — **never touch
+Qt widgets from them directly.** The settings window polls
+`engine.get_backend().detected_family()` from a Qt-thread QTimer
+instead. The Detect button uses a `QObject` + `Signal` bridge to
+marshal worker-thread results into the GUI thread.
 
-`stt_engine.py` and `tts_engine.py` are **thin orchestrators**. The
-actual model code lives in `voxtype/backends/<name>.py` and implements
-the `STTBackend` / `TTSBackend` ABC defined in
-`backends/stt_base.py` / `backends/tts_base.py`.
+## Generic backend dispatcher
 
-The orchestrator owns:
-- load / unload locking + idle-unload watcher
-- status listeners + the `_key()` rebuild trigger
-- the single-thread `ThreadPoolExecutor` for inference
-- the async/sync bridge (sync chunk generator → async queue for streaming)
-
-The backend owns:
-- the actual library import (`transformers`, `faster_whisper`, `kokoro`, `piper`)
-- model resolution rules (HF repo / local path / curated voice id)
-- inference (sync, runs in the executor)
-- the voice / language catalog (used by the UI to build pickers)
-- capability flags via `supports("torch_compile" / "bf16" / "initial_prompt" / …)`
-
-### Currently shipped backends
-
-**STT** (registered in `backends/__init__.py`):
-  - **`whisper`** — `transformers.WhisperForConditionalGeneration` +
-    `AutoProcessor`. Broadest feature set (initial_prompt, torch.compile,
-    bf16, translate-to-EN). Default: `openai/whisper-base`.
-
-**TTS** (registered in `backends/__init__.py`):
-  - **`kokoro`** — `kokoro.KPipeline`. 54 voices across 9 lang_codes.
-    PyTorch, native per-sentence streaming. Default: `hexgrad/Kokoro-82M`.
-
-The pluggable framework is in place; alternative backends
-(faster-whisper, piper, parakeet, coqui, …) will be added when
-there's a concrete need.
-
-### Adding a backend
-
-1. Create `voxtype/backends/<name>.py` subclassing the ABC.
-2. Add one `_register_*("<name>", "voxtype.backends.<name>", "<Class>")`
-   line in `backends/__init__.py`.
-3. Append the optional dep to `voxtype/requirements.txt`.
-
-Backends that fail to import (missing optional dep) are silently
-skipped by the registry — the UI just doesn't list them.
-
-### Engine API (unchanged by the backend split)
+`backends/generic_stt.py` and `backends/generic_tts.py` are the only
+backends registered. Each is a thin dispatcher:
 
 ```python
-eng = stt_engine.get_engine()
-await eng.configure(settings)       # picks backend + applies all knobs
-await eng.ensure_loaded()           # lazy on first request
-text = await eng.transcribe(pcm)
-await eng.unload()
+class GenericSTTBackend(STTBackend):
+    def load_sync(self, cfg):
+        family = fd.detect_stt_family(cfg.model_id)   # config.json + HF API
+        cls = _HANDLERS.get(family, _GenericPipelineHandler)
+        self._handler = cls()
+        try:
+            self._handler.load(cfg)
+            self._family = family
+        except Exception:
+            # Family-specific loader failed (missing optional dep,
+            # exotic model). Fall through to pipeline() universal.
+            self._handler = _GenericPipelineHandler()
+            self._family = fd.STT_GENERIC
+            self._handler.load(cfg)
 ```
 
-Each engine:
-- Accepts either a local path or a HF repo ID as the model setting.
-  Repo IDs are auto-downloaded via `huggingface_hub` to
-  `~/.cache/huggingface/hub` on first load.
-- Holds a single `ThreadPoolExecutor(max_workers=1)` so concurrent
-  inference can't OOM the GPU.
-- Tracks a `_loaded_key` tuple — `configure()` calls that change the
-  key trigger an automatic unload so the next request rebuilds.
-- Spawns an idle-watcher thread that calls `unload()` after
-  `idle_unload_sec` of inactivity.
-- Resolves `device='cuda'` against `torch.cuda.is_available()` with
-  silent CPU fallback + a warning log.
+Family handlers (all inside `generic_stt.py` / `generic_tts.py`):
+
+| File | STT handlers | TTS handlers |
+|---|---|---|
+| `generic_stt.py` | `_WhisperHandler`, `_Wav2Vec2Handler`, `_MMSHandler`, `_SeamlessHandler`, `_MoonshineHandler`, `_S2THandler`, `_GenericPipelineHandler` | — |
+| `generic_tts.py` | — | `_KokoroHandler`, `_VitsHandler`, `_SpeechT5Handler`, `_BarkHandler`, `_ParlerHandler`, `_PipelineTTSHandler` |
+
+Each handler owns its own model + processor and the inference
+loop. No shared state across families.
+
+## Family detection (`backends/family_detect.py`)
+
+Three layers, fast → slow:
+
+1. **Local config.json** — for paths that exist on disk
+   (`_read_local_config`).
+2. **Repo-id substring heuristic** — synchronous, ~0 ms.
+   `_stt_from_repo_id` / `_tts_from_repo_id`. Used by the UI on every
+   `textChanged` so the family pill + voice picker update without
+   blocking on network I/O.
+3. **HuggingFace API** — `huggingface.co/api/models/<id>` +
+   `/resolve/main/config.json`. 3 s timeout. Triggered by the
+   **Detect** button for verification.
+
+Family identifiers are module-level constants
+(`STT_WHISPER`, `STT_WAV2VEC2`, `STT_MMS`, `STT_SEAMLESS`,
+`STT_MOONSHINE`, `STT_S2T`, `STT_SPEECHT5`, `STT_PARAKEET`,
+`STT_QWEN_AUDIO`, `STT_GENERIC`; `TTS_KOKORO`, `TTS_VITS`,
+`TTS_SPEECHT5`, `TTS_BARK`, `TTS_PARLER`, `TTS_XTTS`, `TTS_QWEN_TTS`,
+`TTS_GENERIC`).
+
+Per-family metadata helpers:
+
+| Helper | Used by |
+|---|---|
+| `stt_capabilities(family)` / `tts_capabilities(family)` | UI to gate universal widgets (dtype, torch.compile, speed, stream) |
+| `stt_runtime_options(family)` → `list[OptionSpec]` | UI to render the per-family Advanced section |
+| `tts_runtime_options(family)` → `list[OptionSpec]` | same |
+| `tts_voices_for_family(family)` → `list[VoiceEntry]` | UI to populate the voice picker pre-load (Kokoro/Bark/Parler/SpeechT5 catalogs are static) |
+| `stt_family_label(family)` / `tts_family_label(family)` | UI status pill (`"Whisper · 99 langs · translate"`) |
+
+## Option-spec UI
+
+Every UI knob is described by `OptionSpec` (defined in `stt_base.py`
+and `tts_base.py`):
+
+```python
+@dataclass
+class OptionSpec:
+    key: str          # storage key inside opts dict
+    kind: str         # "enum" | "bool" | "int" | "float" | "str" | "text"
+    label: str
+    default: Any
+    help: str = ""
+    choices: list[tuple[str, str]] = ...   # for enum
+    min: float | None = None
+    max: float | None = None
+    step: float | None = None
+    rebuild: bool = False                  # forces engine reload
+```
+
+`settings_window._render_option(spec, "stt_opts" | "tts_opts")` maps
+the spec to a Qt widget bound to `<bag>.<spec.key>` via
+`config.patch()`. Adding a new family option requires editing only
+`family_detect.py` — no UI code changes.
+
+## Settings shape (`types.py`)
+
+```python
+@dataclass
+class AppSettings:
+    # Universal STT (every family honours these)
+    stt_model_path:    str = "openai/whisper-base"
+    stt_device:        str = "cpu"
+    stt_language:      str = "en"
+    stt_dtype:         str = "auto"
+    stt_warmup:        bool = True
+    stt_torch_compile: bool = False
+    stt_idle_unload_sec: int = 300
+
+    # Family-specific per-call opts — dynamic shape.
+    # Whisper / Seamless:  {"task": "translate", "num_beams": 5,
+    #                       "initial_prompt": "VoxType"}
+    # Wav2Vec2 / MMS / generic: {}
+    stt_opts: dict = field(default_factory=dict)
+
+    # Universal TTS
+    tts_model_path:    str = "hexgrad/Kokoro-82M"
+    tts_device:        str = "cpu"
+    tts_voice:         str = "af_heart"
+    tts_speed:         float = 1.0
+    tts_warmup:        bool = True
+    tts_torch_compile: bool = False
+    tts_stream:        bool = False
+    # Parler:    {"style": "A calm female voice"}
+    # SpeechT5:  {"speaker_embedding": "dataset:row"}
+    # Bark:      {"temperature": 0.7}
+    tts_opts: dict = field(default_factory=dict)
+```
+
+`AppSettings.from_json()` migrates pre-opts-bag settings:
+`stt_task` → `stt_opts.task`, `stt_num_beams` → `stt_opts.num_beams`,
+`stt_initial_prompt` → `stt_opts.initial_prompt`,
+`tts_speaker` → `tts_voice` (renamed),
+`tts_length_scale` → `tts_speed` (renamed).
+Legacy `stt_backend` / `tts_backend` values collapse to `"generic"`.
+
+`config.patch("stt_opts.task", "translate")` style dotted writes
+land in the opts dict; flat keys still work for top-level fields.
 
 ## Embedded HTTP server (`server.py`)
 
@@ -159,94 +250,34 @@ GET  /health                    →  engine readiness snapshot
 GET  /                          →  liveness probe
 ```
 
-The `model` and `voice` request fields are **accepted but ignored** —
-VoxType decides the model + voice via its own settings. External
-clients only address VoxType by host + port.
+The `model` field is accepted-but-ignored (VoxType controls the
+loaded model). The `voice` field on `/v1/audio/speech` IS honoured if
+it matches the loaded backend's catalog; otherwise the configured
+default is used.
 
-Decodes WAV directly; falls through to `soundfile` for other formats.
-Resamples to 16 kHz mono int16 PCM before handing to the engine.
+## Tests
 
-## Settings & hot-reload
+Stdlib-only `unittest` (works under `pytest` too):
 
-`voxtype/config.py` exposes `load()`, `save()`, `reload()`, `patch()`.
-Every UI toggle calls `config.patch("path.to.key", value)` which:
-
-1. Mutates the cached `AppSettings`
-2. Atomically writes `data/settings.json` (tmp + `os.replace`)
-3. Any subsequent `config.load()` sees the new value
-
-**Forces a model rebuild** (engine `_key()` includes these):
-stt_model_path, stt_device, stt_dtype, stt_torch_compile,
-tts_model_path, tts_device, tts_torch_compile.
-`configure()` notices the key change and unloads so the next request
-rebuilds.
-
-**Applied per-call, no rebuild**: stt_language, stt_task, stt_num_beams,
-stt_initial_prompt, tts_speaker, tts_length_scale, tts_stream.
-
-**Applied on next load only**: stt_warmup, tts_warmup.
-
-**Settings → engine propagation**: `configure()` runs (a) at boot, (b)
-before every local-hotkey STT press, (c) on tray Load/Reload, AND (d)
-at the start of every `/v1/audio/transcriptions` and `/v1/audio/speech`
-HTTP request. So changes made in the UI take effect on the next call
-no matter how STT/TTS is invoked — no tray Reload required.
-
-**Requires server restart**: server_port. Use the "Restart" button in
-the Server card.
-
-## Settings shape (key fields)
-
-```python
-@dataclass
-class AppSettings:
-    # Embedded HTTP server
-    server_enabled: bool = True
-    server_port: int = 6600
-
-    # STT (pluggable; currently ships "whisper")
-    stt_enabled: bool = True
-    stt_auto_start: bool = True
-    stt_idle_unload_sec: int = 300
-    stt_backend: STTBackendName = "whisper"
-    stt_model_path: str = "openai/whisper-base"
-    stt_device: TorchDevice = "cpu"
-    stt_language: str = "en"
-    stt_task: STTTask = "transcribe"          # or "translate" → EN
-    stt_dtype: TorchDtype = "auto"            # auto / fp32 / fp16 / bf16
-    stt_num_beams: int = 1                    # 1 = greedy / fastest
-    stt_initial_prompt: str = ""              # bias decoder with jargon
-    stt_warmup: bool = True                   # dummy infer after load
-    stt_torch_compile: bool = False           # +20-40% steady-state
-
-    # TTS (pluggable; currently ships "kokoro")
-    tts_enabled: bool = False
-    tts_auto_start: bool = False
-    tts_idle_unload_sec: int = 600
-    tts_backend: TTSBackendName = "kokoro"
-    tts_model_path: str = "hexgrad/Kokoro-82M"
-    tts_device: TorchDevice = "cpu"
-    tts_speaker: str = "af_heart"
-    tts_length_scale: float = 1.0
-    tts_warmup: bool = True
-    tts_torch_compile: bool = False           # ~15% steady-state win
-    tts_stream: bool = False                  # chunked WAV reply
+```powershell
+.\voxtype-venv\Scripts\python.exe -m unittest discover tests
 ```
 
-## Tray + Settings UI
+Coverage:
+- `test_family_detect.py` — config-blob + repo-id heuristics for
+  every family.
+- `test_settings_migration.py` — legacy-key migration paths.
+- `test_config_patch.py` — flat keys, `stt_opts.*` / `tts_opts.*`
+  dotted writes, persistence to disk.
+- `test_backends_registry.py` — registry only registers `generic`,
+  resolves any model id to the same backend.
+- `test_alias_catalog.py` — `resources/models.json` integrity +
+  coverage.
+- `test_engine_opts_filter.py` — engine forwards only family-relevant
+  opts to the backend.
 
-Sidebar sections:
-- **Dictation** — hotkey, VAD, etc.
-- **Services** — three cards, each with a footer row containing a
-  live status pill and lifecycle buttons:
-  - **OpenAI HTTP Server** — Start / Stop / Restart
-  - **STT** — Load / Unload / Reload
-  - **TTS** — Load / Unload / Reload
-- **LLM** — proxy URL/model + Test Proxy
-- **History** — saved transcripts
-- **Logs** — live tail
-
-Tray submenus mirror STT / TTS / LLM with status + Load / Unload / Reload.
+Each test gets an isolated `VOXTYPE_DATA_DIR` so the real
+`voxtype/data/settings.json` is never touched.
 
 ## Setup script (`setup.ps1`)
 
@@ -256,35 +287,36 @@ Single venv. Idempotent. Parameters:
 |---|---|---|
 | `-InstallDir <path>` | `~/.voxtype` | Where the venv + scheduled task land |
 | `-GpuSupport $true\|$false` | `$true` | Install GPU torch wheel vs CPU wheel |
-| `-CudaVersion cu130\|cu124\|cpu` | `cu130` | Which torch CUDA wheel index. `cu130` = nightly, `cu124` = stable |
+| `-CudaVersion cu130\|cu124\|cpu` | `cu130` | torch CUDA wheel index. `cu130` = nightly, `cu124` = stable |
 
 Phases:
 
-1. **Prereqs**: Python 3.10–3.12, git, ffmpeg (warn-only), GPU detection.
-2. **Single venv**: `voxtype-venv/`. Installs `torch` first from the
-   right `download.pytorch.org/whl/...` index (CUDA 13 nightly, CUDA
-   12.4 stable, or CPU), then everything else from
-   `voxtype/requirements.txt`.
-3. **Pre-download default models**: `openai/whisper-base` (~145 MB)
-   and `hexgrad/Kokoro-82M` (~327 MB) via
-   `huggingface_hub.snapshot_download`. Idempotent — already-cached
-   files skip. Network failure is non-fatal.
-4. **Scheduled task** `VoxType`: runs `pythonw.exe -m voxtype` at logon.
-5. **Seed settings**: `data/settings.json` with AppSettings defaults.
+1. Prereqs: Python 3.10–3.12, git, ffmpeg (warn-only), GPU detect.
+2. Single venv `voxtype-venv/`. Installs `torch` first from the right
+   wheel index, then `voxtype/requirements.txt`.
+3. Pre-download default models (Whisper-base + Kokoro-82M) via
+   `huggingface_hub.snapshot_download`. Idempotent; non-fatal on
+   network failure.
+4. Scheduled task `VoxType` runs `pythonw.exe -m voxtype` at logon.
+5. Seed `data/settings.json` with AppSettings defaults.
 
-## Dependencies (see `voxtype/requirements.txt`)
+## Dependencies (`voxtype/requirements.txt`)
 
-- **torch** — single ML backend. Installed from the torch wheel
-  index matching the requested CUDA version (or CPU). Bundles its
-  own CUDA runtime — no separate CUDA toolkit install needed.
-- **transformers** — STT (`WhisperForConditionalGeneration` + `AutoProcessor`).
-- **kokoro** — TTS (`KPipeline`). Pulls in misaki (G2P) + uses
-  system `espeak-ng` for non-English fallback.
+- **torch** — bundled CUDA runtime.
+- **transformers** — covers every HF speech family.
+- **sentencepiece** — needed by Seamless / Speech2Text tokenizers.
+- **datasets** — SpeechT5 speaker-embedding loading.
 - **huggingface_hub** — model auto-download.
+- **kokoro** — the one TTS family that uses a non-HF loader.
 - **PySide6**, **pynput**, **sounddevice**, **soundfile**, **aiohttp**,
   **numpy**, **Pillow**, **mss**, **pywin32**.
 
-## Testing
+Commented-out optional deps in requirements.txt:
+- **parler-tts** — Parler's style-prompt family. Without it, the
+  generic backend falls through to `pipeline("text-to-speech")`.
+- **phonemizer** + **espeak-ng** — some VITS/Bark/Parler voices.
+
+## Testing the running app
 
 ```powershell
 Stop-ScheduledTask -TaskName VoxType
@@ -293,24 +325,50 @@ Stop-ScheduledTask -TaskName VoxType
 
 Smoke test:
 - Tray icon appears
-- `data/voxtype.log` starts filling (look for `stt ready (device=cuda dtype=torch.float16)`)
+- `data/voxtype.log` starts filling
 - First hotkey: pill goes red → amber (loading) → green text
+- Settings → Services → STT card: model field shows
+  `openai/whisper-base`, status pill shows `✓ Whisper · 99 langs · translate`
+- Settings → Services → TTS card: voice picker is a dropdown with 54
+  Kokoro voices
 - `curl http://127.0.0.1:6600/health` returns engine status JSON
 - `curl http://127.0.0.1:6600/v1/models` lists `whisper-1` + `tts-1`
-- With telecode up: filler words cleaned in the final paste
 
-## What changed in the PyTorch refactor
+## What changed in the generic-backend refactor
 
 Removed:
-- `sherpa-onnx`, `optimum`, `onnxruntime`, `onnxruntime-gpu` deps
-- `stt_quant` setting (no quant variant juggling — transformers + torch
-  handles dtype via `torch_dtype=torch.float16` on GPU).
-- The `model` / `voice` request-field plumbing on the HTTP server.
-  VoxType decides everything via its own settings.
+- The `Backend` dropdown in the STT/TTS cards (there's only one
+  backend now).
+- Per-backend modules `backends/whisper.py` and `backends/kokoro.py`
+  (folded into `generic_stt.py` / `generic_tts.py` as family
+  handlers).
+- The `TranscribeOptions` dataclass (`opts` is now `dict[str, Any]`
+  on the ABC, so adding a new family knob never breaks other
+  backends).
+- AppSettings fields `stt_task`, `stt_num_beams`, `stt_initial_prompt`,
+  `tts_speaker`, `tts_length_scale` (migrated into the opts bags).
 
 Added:
-- `torch` (bundles CUDA runtime — no toolkit install needed)
-- `kokoro` + `misaki` (TTS pipeline + G2P)
-- Voice name field (`af_heart`, `jm_kumo`, …) replacing the integer
-  speaker index.
-- `setup.ps1 -CudaVersion` flag picking the torch wheel channel.
+- `backends/family_detect.py` — fast + slow detection + per-family
+  metadata (capabilities, option specs, voice catalogs, labels).
+- `backends/generic_stt.py` and `backends/generic_tts.py` — the
+  generic dispatchers with all family handlers inline.
+- `voxtype/resources/models.json` — curated friendly-name catalog of
+  recommended HF model ids per family.
+- `tests/` — stdlib unittest suite.
+- `AppSettings.stt_opts` / `tts_opts` — free-form per-family opts
+  bags with on-load migration of legacy top-level keys.
+- `config.patch("stt_opts.task", "translate")` style dotted writes.
+- Spec-driven UI in `settings_window.py`:
+  - `_render_option(spec, "stt_opts" | "tts_opts")` maps an
+    `OptionSpec` to a Qt widget.
+  - The model row's status pill shows the auto-detected family.
+    A synchronous repo-id heuristic runs on every `textChanged`;
+    the **Detect** button verifies against the HF API
+    (worker thread → `QObject` Signal bridge → GUI thread).
+  - The voice picker is populated from the family's static catalog
+    (`fd.tts_voices_for_family(family)`) the moment a family is
+    known — no model load required.
+  - Universal widgets (Language, Dtype, torch.compile, Speed,
+    Stream) auto-hide via `supports(feature)` when the family
+    doesn't honour them.

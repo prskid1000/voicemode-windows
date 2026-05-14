@@ -18,5 +18,7 @@ voxtype-venv/
 Kokoro-FastAPI/
 .claude/
 _*.py
+!tests/__init__.py
+!tests/_isolate.py
 
 .docgraph/

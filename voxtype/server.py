@@ -189,11 +189,12 @@ async def handle_speech(request: web.Request) -> web.Response:
 
     Accepts JSON body with:
       model:           accepted but ignored. VoxType controls the model
-                       through its own settings — external clients only
-                       address the server by host:port.
+                       through its own settings.
       input:           text to synthesize
-      voice:           accepted but ignored. The TTS voice is configured
-                       in VoxType settings (`tts_speaker`).
+      voice:           OpenAI-style voice id (e.g. "af_heart" for Kokoro,
+                       "v2/en_speaker_6" for Bark). Honoured if it
+                       exists in the loaded backend's catalog; otherwise
+                       the configured `tts_voice` default is used.
       speed:           float, default 1.0 (>1 = faster)
       response_format: "wav" (default; we serve WAV natively)
       stream:          bool. If true (or settings.tts_stream is true),
@@ -211,6 +212,8 @@ async def handle_speech(request: web.Request) -> web.Response:
         speed = float(speed_val) if speed_val is not None else None
     except (TypeError, ValueError):
         speed = None
+    voice = body.get("voice")
+    voice = str(voice).strip() if voice else None
 
     engine = tts_engine.get_engine()
     # Pull latest settings before each call so UI edits (voice / speed /
@@ -235,7 +238,7 @@ async def handle_speech(request: web.Request) -> web.Response:
         await resp.prepare(request)
         await resp.write(_wav_header(engine.sample_rate, total_samples=0))
         try:
-            async for pcm in engine.synthesize_pcm_chunks(text, speed=speed):
+            async for pcm in engine.synthesize_pcm_chunks(text, voice=voice, speed=speed):
                 await resp.write(pcm)
         except Exception as exc:
             log.error("speech stream: engine failed: %s", exc)
@@ -243,7 +246,7 @@ async def handle_speech(request: web.Request) -> web.Response:
         return resp
 
     try:
-        wav_bytes = await engine.synthesize(text, speed=speed)
+        wav_bytes = await engine.synthesize(text, voice=voice, speed=speed)
     except Exception as exc:
         log.error("speech: engine failed: %s", exc)
         return web.json_response({"error": str(exc)}, status=500)

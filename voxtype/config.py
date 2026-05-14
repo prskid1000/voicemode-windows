@@ -105,6 +105,25 @@ def patch(path: str, value: Any) -> None:
             for k in keys[1:-1]:
                 target = getattr(target, k)
             setattr(target, keys[-1], value)
+    elif keys[0] in {"stt_opts", "tts_opts"} and len(keys) >= 2:
+        # Dotted writes into the per-family opts bag, e.g.
+        # `config.patch("stt_opts.task", "translate")`. The bag is a
+        # plain dict so we can write arbitrary keys without touching
+        # AppSettings every time a new family adds an option.
+        bag = getattr(s, keys[0])
+        if not isinstance(bag, dict):
+            bag = {}
+            setattr(s, keys[0], bag)
+        # Walk nested keys if any (`stt_opts.advanced.foo`). Most
+        # callers only use depth 2, but the loop is cheap insurance.
+        cur = bag
+        for k in keys[1:-1]:
+            nxt = cur.get(k)
+            if not isinstance(nxt, dict):
+                nxt = {}
+                cur[k] = nxt
+            cur = nxt
+        cur[keys[-1]] = value
     elif len(keys) == 1 and hasattr(s, keys[0]):
         setattr(s, keys[0], value)
     else:

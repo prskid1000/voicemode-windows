@@ -1,16 +1,18 @@
 """TTS engine orchestrator — owns lifecycle, delegates to a backend.
 
 The actual synthesis is done by a swappable
-`voxtype.backends.TTSBackend` instance picked via
-`settings.tts_backend`. This module handles:
+`voxtype.backends.TTSBackend` instance (the generic backend in normal
+use). This module handles:
   - load / unload locking
   - idle-unload watcher
   - status listeners
   - per-call streaming bridge (sync generator → async queue → caller)
   - rebuild-on-config-change via `_key()`
 
-To add a new TTS backend: create `voxtype/backends/<name>.py` and
-register it in `voxtype.backends.__init__`.
+Per-family options live in `settings.tts_opts` (a free-form dict).
+The universal `tts_voice` and `tts_speed` are first-class fields on
+AppSettings; everything else (style prompts, speaker embeddings,
+sampling temperature, reference audio for cloning) lives in tts_opts.
 """
 from __future__ import annotations
 
@@ -24,13 +26,14 @@ from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from typing import Any, Callable
 
-from voxtype.backends import get_tts_backend, tts_backend_names
+from voxtype.backends import (
+    get_tts_backend, resolve_tts_backend, tts_backend_names,
+)
 from voxtype.backends.tts_base import TTSBackend, TTSLoadConfig
 
 log = logging.getLogger("voxtype.tts_engine")
 
 
-# Re-exports for legacy callers / the UI.
 DEFAULT_MODEL = "hexgrad/Kokoro-82M"
 DEFAULT_VOICE = "af_heart"
 
@@ -39,43 +42,35 @@ def available_backends() -> list[str]:
     return tts_backend_names()
 
 
-def _backend_voice_options(backend_name: str) -> list[tuple[str, str]]:
-    """Voice catalog for the named backend (used by the settings UI)."""
+def _safe_backend(name: str = "generic") -> TTSBackend | None:
     try:
-        be = get_tts_backend(backend_name)
-        return be.voice_combo_options()
+        return get_tts_backend(name)
     except Exception as exc:  # noqa: BLE001
-        log.warning("voice options for %r unavailable: %s", backend_name, exc)
-        return []
+        log.warning("tts backend %r unavailable: %s", name, exc)
+        return None
 
 
 def voice_combo_options(backend_name: str | None = None) -> list[tuple[str, str]]:
-    """Backwards-compatible voice combo helper used by the UI.
-    When backend_name is None, defaults to the kokoro catalog so callers
-    that don't yet know about pluggable backends still work."""
-    return _backend_voice_options(backend_name or "kokoro")
+    """Voice catalog from a NOT-yet-loaded backend instance. For the
+    generic backend this returns an empty list pre-load; the UI shows
+    a placeholder and rebuilds the picker once the model loads."""
+    be = _safe_backend(backend_name or "generic")
+    return be.voice_combo_options() if be else []
 
 
 def all_voice_ids(backend_name: str | None = None) -> set[str]:
-    try:
-        be = get_tts_backend(backend_name or "kokoro")
-        return be.voice_ids()
-    except Exception:
-        return set()
+    be = _safe_backend(backend_name or "generic")
+    return be.voice_ids() if be else set()
 
 
 def default_voice_for(backend_name: str) -> str:
-    try:
-        return get_tts_backend(backend_name).default_voice
-    except Exception:
-        return DEFAULT_VOICE
+    be = _safe_backend(backend_name)
+    return be.default_voice if be else DEFAULT_VOICE
 
 
 def default_model_for(backend_name: str) -> str:
-    try:
-        return get_tts_backend(backend_name).default_model
-    except Exception:
-        return DEFAULT_MODEL
+    be = _safe_backend(backend_name)
+    return be.default_model if be else DEFAULT_MODEL
 
 
 @dataclass
@@ -85,6 +80,7 @@ class TTSStatus:
     pid: int | None = None
     last_error: str = ""
     backend: str = ""
+    family: str = ""
 
     @property
     def name(self) -> str:
@@ -106,14 +102,14 @@ class TTSEngine:
         self._idle_unload_sec = 0
         self._idle_watch_started = False
 
-        # Current settings.
         self._model_path = ""
         self._device = "cpu"
-        self._speaker = ""
-        self._length_scale = 1.0
+        self._voice = ""
+        self._speed = 1.0
         self._warmup = True
         self._torch_compile = False
         self._stream_default = False
+        self._opts: dict[str, Any] = {}
 
     # ── Listener wiring ──────────────────────────────────────────────
 
@@ -121,13 +117,23 @@ class TTSEngine:
         self._listeners.append(fn)
 
     def get_status(self) -> TTSStatus:
+        family = ""
+        if self._backend is not None:
+            try:
+                family = self._backend.detected_family() or ""
+            except Exception:
+                family = ""
         return TTSStatus(
             running=self._status.running,
             ready=self._status.ready,
             pid=None,
             last_error=self._status.last_error,
             backend=self._backend_name,
+            family=family,
         )
+
+    def get_backend(self) -> TTSBackend | None:
+        return self._backend
 
     def _notify(self) -> None:
         for fn in list(self._listeners):
@@ -138,55 +144,48 @@ class TTSEngine:
 
     # ── Configuration ────────────────────────────────────────────────
 
-    def _effective_backend_name(self) -> str:
-        avail = available_backends() or ["kokoro"]
-        return self._backend_name if self._backend_name in avail else avail[0]
-
     def _effective_model(self) -> str:
         if self._model_path:
             return self._model_path
         if self._backend is not None:
             return self._backend.default_model
-        return default_model_for(self._effective_backend_name())
+        return DEFAULT_MODEL
 
     def _effective_voice(self) -> str:
-        """Validate the configured voice against the ACTIVE backend's
-        catalog. This is the key robustness gate: if the user switches
-        backends in settings.json (kokoro voice → piper backend) without
-        also updating tts_speaker, we transparently fall back to that
-        backend's default instead of trying to load a voice the new
-        backend doesn't know about."""
-        backend_name = self._effective_backend_name()
-        default = default_voice_for(backend_name)
-        v = (self._speaker or "").strip()
-        if not v or v.isdigit() or len(v) < 3:
-            return default
-        if v not in all_voice_ids(backend_name):
-            return default
-        return v
+        """Validate voice against the loaded backend's catalog. If the
+        catalog is empty (generic backend pre-load), accept the user
+        value as-is — the family handler will fall back to its default
+        when the catalog appears."""
+        v = (self._voice or "").strip()
+        be = self._backend
+        if be is None:
+            return v or DEFAULT_VOICE
+        ids = be.voice_ids()
+        if not ids:
+            return v or (be.default_voice or DEFAULT_VOICE)
+        if v in ids:
+            return v
+        return be.default_voice or next(iter(ids), DEFAULT_VOICE)
 
     def _key(self) -> tuple:
         return (
-            self._effective_backend_name(),
+            "generic",
             self._effective_model(), self._device,
             bool(self._torch_compile),
         )
 
     async def configure(self, s) -> None:
-        new_backend = str(getattr(s, "tts_backend", "kokoro") or "kokoro")
-        if new_backend != self._backend_name:
-            if self._backend is not None:
-                await self.unload()
-            self._backend_name = new_backend
-
+        self._backend_name = "generic"
         self._model_path = str(getattr(s, "tts_model_path", "") or "")
         self._device = str(getattr(s, "tts_device", "cpu"))
-        self._speaker = str(getattr(s, "tts_speaker", "") or "")
-        self._length_scale = float(getattr(s, "tts_length_scale", 1.0) or 1.0)
+        self._voice = str(getattr(s, "tts_voice", "") or "")
+        self._speed = float(getattr(s, "tts_speed", 1.0) or 1.0)
         self._warmup = bool(getattr(s, "tts_warmup", True))
         self._torch_compile = bool(getattr(s, "tts_torch_compile", False))
         self._stream_default = bool(getattr(s, "tts_stream", False))
         self._idle_unload_sec = int(getattr(s, "tts_idle_unload_sec", 0))
+        opts = getattr(s, "tts_opts", {}) or {}
+        self._opts = dict(opts) if isinstance(opts, dict) else {}
 
         if self._loaded_key is not None and self._loaded_key != self._key():
             log.info("tts config changed — unloading current backend")
@@ -213,11 +212,10 @@ class TTSEngine:
             await self._do_load_locked()
 
     async def _do_load_locked(self) -> None:
-        name = self._effective_backend_name()
-        backend = get_tts_backend(name)
-        model_id = self._effective_model() or backend.default_model
+        model_id = self._effective_model()
+        backend = resolve_tts_backend(model_id)
         log.info("tts loading backend=%s model=%s device=%s",
-                 name, model_id, self._device)
+                 backend.name, model_id, self._device)
         self._status.last_error = ""
         self._status.running = False
         self._status.ready = False
@@ -227,18 +225,18 @@ class TTSEngine:
             model_id=model_id,
             device=self._device,
             warmup=self._warmup,
-            torch_compile=self._torch_compile and backend.supports("torch_compile"),
+            torch_compile=self._torch_compile,
         )
         loop = asyncio.get_event_loop()
         try:
             await loop.run_in_executor(self._exec, backend.load_sync, cfg)
             self._backend = backend
-            self._backend_name = name
+            self._backend_name = backend.name
             self._loaded_key = self._key()
             self._status.running = True
             self._status.ready = True
             self._last_used = time.monotonic()
-            log.info("tts ready (backend=%s %s)", name, backend.runtime_info())
+            log.info("tts ready (backend=%s %s)", backend.name, backend.runtime_info())
             self._notify()
             self._ensure_idle_watcher()
         except Exception as exc:  # noqa: BLE001
@@ -272,24 +270,39 @@ class TTSEngine:
 
     # ── Synthesis ────────────────────────────────────────────────────
 
-    def _resolve_call(self, voice: str | None, speed: float | None) -> tuple[str, float]:
+    def _build_opts(self, voice: str | None,
+                     speed: float | None) -> tuple[str, dict[str, Any]]:
+        """Resolve the per-call voice + return the family opts dict."""
         v = (voice or "").strip() if isinstance(voice, str) else ""
         if not v:
             v = self._effective_voice()
         else:
-            # Per-call voice override: validate against active backend.
-            backend_name = self._effective_backend_name()
-            if v not in all_voice_ids(backend_name):
-                log.debug("tts: per-call voice %r not in %s catalog — using effective default",
-                          v, backend_name)
-                v = self._effective_voice()
+            # Per-call override — accept any catalog match, otherwise
+            # fall back to the configured default.
+            be = self._backend
+            if be is not None:
+                ids = be.voice_ids()
+                if ids and v not in ids:
+                    log.debug("tts: per-call voice %r unknown — using default", v)
+                    v = self._effective_voice()
         # Speed only applies if the backend honours it.
-        backend = self._backend
-        supports_speed = backend.supports("speed") if backend is not None else True
+        be = self._backend
+        supports_speed = be.supports("speed") if be is not None else True
+        spd = (float(speed) if (speed and speed > 0)
+               else float(self._speed or 1.0))
         if not supports_speed:
-            return v, 1.0
-        spd = float(speed) if (speed and speed > 0) else float(self._length_scale or 1.0)
-        return v, spd
+            spd = 1.0
+        # Per-call opts = configured family-specific opts + speed key.
+        opts = dict(self._opts)
+        opts["speed"] = spd
+        # Filter against backend's runtime spec when available, so
+        # stale keys from a different family don't leak through.
+        if be is not None:
+            specs = be.runtime_options()
+            if specs:
+                allowed = {"speed"} | {s.key for s in specs}
+                opts = {k: opts[k] for k in opts if k in allowed}
+        return v, opts
 
     async def synthesize(self, text: str,
                           voice: str | None = None,
@@ -298,15 +311,15 @@ class TTSEngine:
         await self.ensure_loaded()
         assert self._backend is not None
         self._last_used = time.monotonic()
-        v, spd = self._resolve_call(voice, speed)
+        v, opts = self._build_opts(voice, speed)
         loop = asyncio.get_event_loop()
-        return await loop.run_in_executor(self._exec, self._collect_wav, text, v, spd)
+        return await loop.run_in_executor(self._exec, self._collect_wav, text, v, opts)
 
-    def _collect_wav(self, text: str, voice: str, speed: float) -> bytes:
+    def _collect_wav(self, text: str, voice: str, opts: dict[str, Any]) -> bytes:
         """Drain the backend's sync chunk generator into a single WAV."""
         assert self._backend is not None
         parts: list[bytes] = []
-        for chunk in self._backend.synth_chunks_sync(text, voice, speed):
+        for chunk in self._backend.synth_chunks_sync(text, voice, opts):
             if chunk:
                 parts.append(chunk)
         pcm = b"".join(parts)
@@ -328,7 +341,7 @@ class TTSEngine:
         await self.ensure_loaded()
         assert self._backend is not None
         self._last_used = time.monotonic()
-        v, spd = self._resolve_call(voice, speed)
+        v, opts = self._build_opts(voice, speed)
 
         loop = asyncio.get_event_loop()
         queue: asyncio.Queue = asyncio.Queue(maxsize=8)
@@ -336,7 +349,7 @@ class TTSEngine:
         def _producer() -> None:
             try:
                 assert self._backend is not None
-                for chunk in self._backend.synth_chunks_sync(text, v, spd):
+                for chunk in self._backend.synth_chunks_sync(text, v, opts):
                     if not chunk:
                         continue
                     asyncio.run_coroutine_threadsafe(queue.put(chunk), loop).result()
